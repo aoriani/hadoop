@@ -133,4 +133,19 @@ public class LocatedBlock implements Writable {
       locs[i].readFields(in);
     }
   }
+  
+  public String toString(){
+  	String ret = "\n";
+  	ret += b;
+  	if(corrupt){
+  		ret += "\nCorrupted";
+  	}else{
+  		ret += "\nNot Corrupted";
+  	}
+  	ret += "\noffset:"+offset;
+  	for(int i=0; i< locs.length; i++){
+  		locs[i].toString();
+  	}
+  	return ret;
+  }
 }

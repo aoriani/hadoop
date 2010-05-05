@@ -17,15 +17,19 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.*;
 
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.io.Writable;
 
 /* Class for keeping track of under replication blocks
  * Blocks have replication priority, with priority 0 indicating the highest
  * Blocks have only one replicas has the highest
  */
-class UnderReplicatedBlocks implements Iterable<Block> {
+class UnderReplicatedBlocks implements Iterable<Block>, Writable {
   private static final int LEVEL = 3;
   private List<TreeSet<Block>> priorityQueues = new ArrayList<TreeSet<Block>>();
       
@@ -216,5 +220,36 @@ class UnderReplicatedBlocks implements Iterable<Block> {
         iterators.get(level).remove();
       }
     };
+  }
+
+  @Override
+  public void readFields(DataInput in) throws IOException {
+  	FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+  	BlocksMap blocksMap = fsNamesys.blocksMap;
+
+  	clear();
+  	for(int i=0; i < LEVEL; i++){
+  		int nBlocks = in.readInt();
+  		TreeSet<Block> set = priorityQueues.get(i);
+  		assert set != null;
+  		for(int j=0; j < nBlocks; j++){
+  			Block b = blocksMap.getStoredBlock(new Block(in.readLong()));
+  			assert b != null;
+  			set.add(b);
+  		}
+  	}
+  }
+
+  @Override
+  public void write(DataOutput out) throws IOException {
+  	//System.out.println("neededReplBlock");
+  	for(int i=0; i < LEVEL; i++){
+  		TreeSet<Block> set = priorityQueues.get(i);
+  		out.writeInt(set.size());
+  		for(Block b : set){
+  			out.writeLong(b.getBlockId());
+  			//System.out.println("bid"+b.getBlockId());
+  		}
+  	}
   }
 }

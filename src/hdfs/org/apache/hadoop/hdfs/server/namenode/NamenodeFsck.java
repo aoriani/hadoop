@@ -33,6 +33,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.NodeBase;
+import org.apache.hadoop.hdfs.BFTRandom;
 import org.apache.hadoop.hdfs.DFSClient;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
@@ -456,7 +457,8 @@ public class NamenodeFsck {
    * Pick the best node from which to stream the data.
    * That's the local one, if available.
    */
-  Random r = new Random();
+  //Random r = new Random();
+  Random r = BFTRandom.getRandom();
   private DatanodeInfo bestNode(DFSClient dfs, DatanodeInfo[] nodes,
                                 TreeSet<DatanodeInfo> deadNodes) throws IOException {
     if ((nodes == null) ||
@@ -464,6 +466,7 @@ public class NamenodeFsck {
       throw new IOException("No live nodes contain current block");
     }
     DatanodeInfo chosenNode;
+    //r = BFTRandom.getRandom();
     do {
       chosenNode = nodes[r.nextInt(nodes.length)];
     } while (deadNodes.contains(chosenNode));

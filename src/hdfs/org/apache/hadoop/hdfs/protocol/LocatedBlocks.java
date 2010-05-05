@@ -184,4 +184,18 @@ public class LocatedBlocks implements Writable {
       this.blocks.add(blk);
     }
   }
+  
+  public String toString(){
+  	String ret="";
+  	ret += "Length:"+this.fileLength+"\n";
+  	if(underConstruction)
+  		ret += "Underconstruction\n";
+  	ret += "nrBlocks:"+locatedBlockCount()+"\n";
+  	
+  	for (LocatedBlock blk : this.blocks){
+  		ret += blk.toString();
+  	}
+  	
+  	return ret;
+  }
 }

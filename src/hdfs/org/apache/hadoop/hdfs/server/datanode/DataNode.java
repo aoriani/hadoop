@@ -183,6 +183,10 @@ public class DataNode extends Configured
   
   // For InterDataNodeProtocol
   public Server ipcServer;
+  
+  public boolean bft;
+  public boolean bftdatanode;
+  public static boolean fakemd5=false;
 
   /**
    * Current system time.
@@ -253,13 +257,32 @@ public class DataNode extends Configured
     storage = new DataStorage();
     // construct registration
     this.dnRegistration = new DatanodeRegistration(machineName + ":" + tmpPort);
+    bftdatanode = conf.getBoolean("dfs.bft.datanode", false);
+    fakemd5 = conf.getBoolean("dfs.bft.fakemd5", false); // just for performance analysis purpose
+    if(conf.getBoolean("dfs.bft", false)){
+    	LOG.info("BFT Mode");
+    	bft = true;
 
-    // connect to name node
-    this.namenode = (DatanodeProtocol) 
-      RPC.waitForProxy(DatanodeProtocol.class,
-                       DatanodeProtocol.versionID,
-                       nameNodeAddr, 
-                       conf);
+    	// Connect to UpRight Glue instead of namenode
+    	String glueRPCServerAddr =       	
+    		conf.get("dfs.bft.clientGlue.ip","localhost") + ":"
+    		+ conf.getInt("dfs.bft.clientGlue.rpcport", 8989);
+    	InetSocketAddress glueAddr = 
+    		NetUtils.createSocketAddr(glueRPCServerAddr);
+    	this.namenode = (DatanodeProtocol)RPC.waitForProxy(DatanodeProtocol.class, 
+    			DatanodeProtocol.versionID, glueAddr,
+    			conf);
+
+    }else{
+    	LOG.info("None BFT Mode");
+    	bft = false;
+    	// connect to name node
+    	this.namenode = (DatanodeProtocol) 
+    	RPC.waitForProxy(DatanodeProtocol.class,
+    			DatanodeProtocol.versionID,
+    			nameNodeAddr, 
+    			conf);
+    }
     // get version and id info from the name-node
     NamespaceInfo nsInfo = handshake();
     StartupOption startOpt = getStartupOption(conf);
@@ -288,7 +311,13 @@ public class DataNode extends Configured
       // adjust
       this.dnRegistration.setStorageInfo(storage);
       // initialize data node internal structure
-      this.data = new FSDataset(storage, conf);
+      
+      
+      if(bftdatanode){
+      	this.data = new BFTFSDataset(storage, conf);
+      }else{
+      	this.data = new FSDataset(storage, conf);
+      }
     }
 
       
@@ -720,8 +749,13 @@ public class DataNode extends Configured
           //
           long brStartTime = now();
           Block[] bReport = data.getBlockReport();
-          DatanodeCommand cmd = namenode.blockReport(dnRegistration,
+          DatanodeCommand cmd;
+          if(bftdatanode){
+          	cmd = namenode.blockReport(dnRegistration,bReport);                
+          }else{
+          	cmd = namenode.blockReport(dnRegistration,
                   BlockListAsLongs.convertToArrayLongs(bReport));
+          }
           long brTime = now() - brStartTime;
           myMetrics.blockReports.inc(brTime);
           LOG.info("BlockReport of " + bReport.length +
@@ -830,6 +864,16 @@ public class DataNode extends Configured
     case DatanodeProtocol.DNA_RECOVERBLOCK:
       recoverBlocks(bcmd.getBlocks(), bcmd.getTargets());
       break;
+    case DatanodeProtocol.DNA_ROLLBACKBLOCK:
+    	Block[] blocks = bcmd.getBlocks();
+    	int n = blocks.length / 2;
+    	for(int i=0; i < n; i++){
+    		Block oldBlk = blocks[2*i];
+    		Block newBlk = blocks[2*i+1];
+    		updateBlock(oldBlk, newBlk, true);
+    	}
+    	
+    	break;
     default:
       LOG.warn("Unknown DatanodeCommand action: " + cmd.getAction());
     }
@@ -899,6 +943,7 @@ public class DataNode extends Configured
     if(block==null || delHint==null) {
       throw new IllegalArgumentException(block==null?"Block is null":"delHint is null");
     }
+    LOG.debug("notifyNamenodeReceivedBlock : Block hash : " +block.getHash());
     synchronized (receivedBlockList) {
       synchronized (delHints) {
         receivedBlockList.add(block);
@@ -1338,6 +1383,13 @@ public class DataNode extends Configured
   public void updateBlock(Block oldblock, Block newblock, boolean finalize) throws IOException {
     LOG.info("oldblock=" + oldblock + ", newblock=" + newblock
         + ", datanode=" + dnRegistration.getName());
+    if(bftdatanode && !finalize){
+    	//Check if this request is valid with namenode
+    	String clientAddr = Server.getRemoteAddress();
+    	if(!namenode.confirmBlockUpdate(clientAddr, oldblock)){
+    		throw new IOException("Invalid request");
+    	}
+    }
     data.updateBlock(oldblock, newblock);
     if (finalize) {
       data.finalizeBlock(newblock);

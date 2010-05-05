@@ -45,33 +45,34 @@ class BlockSender implements java.io.Closeable, FSConstants {
   public static final Log LOG = DataNode.LOG;
   static final Log ClientTraceLog = DataNode.ClientTraceLog;
   
-  private Block block; // the block to read from
-  private InputStream blockIn; // data stream
-  private long blockInPosition = -1; // updated while using transferTo().
-  private DataInputStream checksumIn; // checksum datastream
-  private DataChecksum checksum; // checksum stream
-  private long offset; // starting position to read
-  private long endOffset; // ending position
-  private long blockLength;
-  private int bytesPerChecksum; // chunk size
-  private int checksumSize; // checksum size
-  private boolean corruptChecksumOk; // if need to verify checksum
-  private boolean chunkOffsetOK; // if need to send chunk offset
-  private long seqno; // sequence number of packet
+  protected Block block; // the block to read from
+  protected InputStream blockIn; // data stream
+  protected long blockInPosition = -1; // updated while using transferTo().
+  protected DataInputStream checksumIn; // checksum datastream
+  protected DataChecksum checksum; // checksum stream
+  protected long offset; // starting position to read
+  protected long endOffset; // ending position
+  protected long blockLength;
+  protected int bytesPerChecksum; // chunk size
+  protected int checksumSize; // checksum size
+  protected boolean corruptChecksumOk; // if need to verify checksum
+  protected boolean chunkOffsetOK; // if need to send chunk offset
+  protected long seqno; // sequence number of packet
 
-  private boolean transferToAllowed = true;
-  private boolean blockReadFully; //set when the whole block is read
-  private boolean verifyChecksum; //if true, check is verified while reading
-  private BlockTransferThrottler throttler;
-  private final String clientTraceFmt; // format of client trace log message
+  protected boolean transferToAllowed = true;
+  protected boolean blockReadFully; //set when the whole block is read
+  protected boolean verifyChecksum; //if true, check is verified while reading
+  protected BlockTransferThrottler throttler;
+  protected String clientTraceFmt; // format of client trace log message
 
   /**
    * Minimum buffer used while sending data to clients. Used only if
    * transferTo() is enabled. 64KB is not that large. It could be larger, but
    * not sure if there will be much more improvement.
    */
-  private static final int MIN_BUFFER_WITH_TRANSFERTO = 64*1024;
+  protected static final int MIN_BUFFER_WITH_TRANSFERTO = 64*1024;
 
+  protected BlockSender(){}
   
   BlockSender(Block block, long startOffset, long length,
               boolean corruptChecksumOk, boolean chunkOffsetOK,
@@ -208,7 +209,7 @@ class BlockSender implements java.io.Closeable, FSConstants {
    * {@link SocketOutputStream#transferToFully(FileChannel, long, int)} to
    * send data (and updates blockInPosition).
    */
-  private int sendChunks(ByteBuffer pkt, int maxChunks, OutputStream out) 
+  protected int sendChunks(ByteBuffer pkt, int maxChunks, OutputStream out) 
                          throws IOException {
     // Sends multiple chunks in one packet with a single write().
 

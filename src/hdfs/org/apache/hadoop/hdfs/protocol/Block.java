@@ -60,6 +60,9 @@ public class Block implements Writable, Comparable<Block> {
   private long blockId;
   private long numBytes;
   private long generationStamp;
+  
+  private byte[] hash; // hash of this whole block
+  private byte[] addedHash; // hash of added part of this block by append
 
   public Block() {this(0, 0, 0);}
 
@@ -69,7 +72,11 @@ public class Block implements Writable, Comparable<Block> {
 
   public Block(final long blkid) {this(blkid, 0, GenerationStamp.WILDCARD_STAMP);}
 
-  public Block(Block blk) {this(blk.blockId, blk.numBytes, blk.generationStamp);}
+  public Block(Block blk) {
+  	this(blk.blockId, blk.numBytes, blk.generationStamp);
+  	this.hash = blk.hash;
+  	this.addedHash = blk.addedHash;
+  }  
 
   /**
    * Find the blockid from the given filename
@@ -78,7 +85,12 @@ public class Block implements Writable, Comparable<Block> {
     this(filename2id(f.getName()), len, genstamp);
   }
 
-  public void set(long blkid, long len, long genStamp) {
+  public Block(File file, long length, long genStamp, byte[] hash2) {
+		this(file, length, genStamp);
+		this.hash = hash2;
+	}
+
+	public void set(long blkid, long len, long genStamp) {
     this.blockId = blkid;
     this.numBytes = len;
     this.generationStamp = genStamp;
@@ -115,6 +127,22 @@ public class Block implements Writable, Comparable<Block> {
   public void setGenerationStamp(long stamp) {
     generationStamp = stamp;
   }
+  
+  public byte [] getHash(){
+  	return hash;
+  }
+  
+  public void setHash(byte[] h){
+  	hash = h;
+  }
+  
+  public byte [] getAddedHash(){
+  	return addedHash;
+  }
+  
+  public void setAddedHash(byte[] h){
+  	addedHash = h;
+  }
 
   /**
    */
@@ -129,6 +157,20 @@ public class Block implements Writable, Comparable<Block> {
     out.writeLong(blockId);
     out.writeLong(numBytes);
     out.writeLong(generationStamp);
+    
+    if(hash!=null){
+    	out.writeInt(hash.length);
+    	out.write(hash);
+    } else {
+    	out.writeInt(0);
+    }
+    
+    if(addedHash!=null){
+    	out.writeInt(addedHash.length);
+    	out.write(addedHash);
+    } else {
+    	out.writeInt(0);
+    }
   }
 
   public void readFields(DataInput in) throws IOException {
@@ -138,6 +180,23 @@ public class Block implements Writable, Comparable<Block> {
     if (numBytes < 0) {
       throw new IOException("Unexpected block size: " + numBytes);
     }
+    
+    int hashLen = in.readInt();
+    if(hashLen > 0){
+    	hash = new byte[hashLen];
+    	in.readFully(hash, 0, hashLen);
+    } else {
+    	hash = null;
+    }
+    
+    hashLen = in.readInt();
+    if(hashLen > 0){
+    	addedHash = new byte[hashLen];
+    	in.readFully(addedHash, 0, hashLen);
+    } else {
+    	addedHash = null;
+    }
+    
   }
 
   /////////////////////////////////////

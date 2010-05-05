@@ -543,7 +543,15 @@ public class MiniDFSCluster {
   public void shutdown() {
     System.out.println("Shutting down the Mini HDFS Cluster");
     shutdownDataNodes();
-    if (nameNode != null) {
+    shutdownNameNode();
+  }
+  
+  /**
+   * Shut down the NameNode
+   */
+  public void shutdownNameNode(){
+    System.out.println("Shutting down the NameNode");
+    if(nameNode!=null){
       nameNode.stop();
       nameNode.join();
       nameNode = null;
@@ -563,6 +571,28 @@ public class MiniDFSCluster {
     }
   }
 
+  public NameNode startNameNode(StartupOption operation) throws IOException{
+
+
+    base_dir = new File(System.getProperty("test.build.data", "build/test/data"), "dfs/");
+    data_dir = new File(base_dir, "data");
+    
+
+    // Start the NameNode
+    String[] args = (operation == null ||
+                     operation == StartupOption.FORMAT ||
+                     operation == StartupOption.REGULAR) ?
+      new String[] {} : new String[] {"-"+operation.toString()};
+    conf.setClass("topology.node.switch.mapping.impl", 
+                   StaticMapping.class, DNSToSwitchMapping.class);
+    nameNode = NameNode.createNameNode(args, conf);
+    
+
+    waitClusterUp();
+    
+    return nameNode;
+  }
+  
   /*
    * Corrupt a block on all datanode
    */

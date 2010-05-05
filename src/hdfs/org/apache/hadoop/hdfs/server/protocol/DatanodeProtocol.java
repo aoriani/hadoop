@@ -61,6 +61,8 @@ public interface DatanodeProtocol extends VersionedProtocol {
   final static int DNA_REGISTER = 4;   // re-register
   final static int DNA_FINALIZE = 5;   // finalize previous upgrade
   final static int DNA_RECOVERBLOCK = 6;  // request a block recovery
+  
+  final static int DNA_ROLLBACKBLOCK = 7; // roll-back a block to prev. status 
 
   /** 
    * Register Datanode.
@@ -103,7 +105,14 @@ public interface DatanodeProtocol extends VersionedProtocol {
    */
   public DatanodeCommand blockReport(DatanodeRegistration registration,
                                      long[] blocks) throws IOException;
-    
+  
+  /**
+   * BFT DataNode version of blockReport
+   * We need to send the hash along with the other block information.
+   * Hence, we just send Block[]
+   */
+	public DatanodeCommand blockReport(DatanodeRegistration dnRegistration,
+			Block[] report) throws IOException;
   /**
    * blockReceived() allows the DataNode to tell the NameNode about
    * recently-received block data, with a hint for pereferred replica
@@ -157,4 +166,15 @@ public interface DatanodeProtocol extends VersionedProtocol {
       long newgenerationstamp, long newlength,
       boolean closeFile, boolean deleteblock, DatanodeID[] newtargets
       ) throws IOException;
+
+  /**
+   * BFT datanode specific
+   * Check if this block update is valid one
+   * @param clientAddr
+   * @param block
+   * @return
+   * @throws IOException
+   */
+  public boolean confirmBlockUpdate(String clientAddr, Block block) throws IOException;
+  
 }

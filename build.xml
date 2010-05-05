@@ -98,12 +98,12 @@
   <property name="test.build.javadoc.dev" value="${test.build.dir}/docs/dev-api"/>
   <property name="test.include" value="Test*"/>
   <property name="test.classpath.id" value="test.classpath"/>
-  <property name="test.output" value="no"/>
+  <property name="test.output" value="yes"/>
   <property name="test.timeout" value="900000"/>
   <property name="test.junit.output.format" value="plain"/>
   <property name="test.junit.fork.mode" value="perTest" />
   <property name="test.junit.printsummary" value="yes" />
-  <property name="test.junit.haltonfailure" value="no" />
+  <property name="test.junit.haltonfailure" value="yes" />
   <property name="test.junit.maxmemory" value="256m" />
 
   <property name="libhdfs.test.conf.dir" value="${libhdfs.src}/tests/conf"/>

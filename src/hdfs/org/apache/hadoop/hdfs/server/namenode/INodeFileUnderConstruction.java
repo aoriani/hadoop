@@ -29,9 +29,13 @@ public class INodeFileUnderConstruction extends INodeFile {
   StringBytesWritable clientMachine = null;
   DatanodeDescriptor clientNode = null; // if client is a cluster node too.
 
-  private int primaryNodeIndex = -1; //the node working on lease recovery
+  protected int primaryNodeIndex = -1; //the node working on lease recovery
   private DatanodeDescriptor[] targets = null;   //locations for last block
-  private long lastRecoveryTime = 0;
+  protected long lastRecoveryTime = 0;
+  
+  // Hash of the last block that is being appended
+  // Used for lease recovery in bft-datanode
+  protected byte[] previousHash = null;
   
   INodeFileUnderConstruction() {}
 
@@ -79,6 +83,10 @@ public class INodeFileUnderConstruction extends INodeFile {
   DatanodeDescriptor getClientNode() {
     return clientNode;
   }
+  
+  void setClientNode(DatanodeDescriptor cn) {
+  	clientNode = cn;
+  }
 
   /**
    * Is this inode being constructed?
@@ -95,6 +103,14 @@ public class INodeFileUnderConstruction extends INodeFile {
   void setTargets(DatanodeDescriptor[] targets) {
     this.targets = targets;
     this.primaryNodeIndex = -1;
+  }
+  
+  void setPreviousHash(byte[] hash){
+  	this.previousHash = hash;
+  }
+  
+  byte[] getPreviousHash(){
+  	return this.previousHash;
   }
 
   //

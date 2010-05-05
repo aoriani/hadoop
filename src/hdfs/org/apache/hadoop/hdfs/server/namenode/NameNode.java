@@ -25,6 +25,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.Trash;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.permission.*;
+import org.apache.hadoop.hdfs.BFTRandom;
 import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
 import org.apache.hadoop.hdfs.server.common.IncorrectVersionException;
@@ -38,17 +39,21 @@ import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
 import org.apache.hadoop.hdfs.server.protocol.NamenodeProtocol;
 import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.hdfs.server.protocol.UpgradeCommand;
+import org.apache.hadoop.io.MD5Hash;
 import org.apache.hadoop.ipc.*;
 import org.apache.hadoop.conf.*;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.net.DNS;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.security.UserGroupInformation;
 
 import java.io.*;
 import java.net.*;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.LinkedList;
 
 /**********************************************************
  * NameNode serves as both directory namespace manager and
@@ -85,7 +90,8 @@ import java.util.Iterator;
  * state, for example partial blocksMap etc.
  **********************************************************/
 public class NameNode implements ClientProtocol, DatanodeProtocol,
-                                 NamenodeProtocol, FSConstants {
+                                 NamenodeProtocol, FSConstants, 
+                                 BFTGlueNamenodeProtocol {
   public long getProtocolVersion(String protocol, 
                                  long clientVersion) throws IOException { 
     if (protocol.equals(ClientProtocol.class.getName())) {
@@ -94,12 +100,16 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
       return DatanodeProtocol.versionID;
     } else if (protocol.equals(NamenodeProtocol.class.getName())){
       return NamenodeProtocol.versionID;
+    } else if (protocol.equals(BFTGlueNamenodeProtocol.class.getName())){
+    	return BFTGlueNamenodeProtocol.versionID;
     } else {
       throw new IOException("Unknown protocol to name node: " + protocol);
     }
   }
     
-  public static final int DEFAULT_PORT = 8020;
+  public static int DEFAULT_PORT = 8020;
+  
+  public static boolean isHelper = false;
 
   public static final Log LOG = LogFactory.getLog(NameNode.class.getName());
   public static final Log stateChangeLog = LogFactory.getLog("org.apache.hadoop.hdfs.StateChange");
@@ -127,6 +137,15 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
   }
   
   public static InetSocketAddress getAddress(String address) {
+  	if(isHelper){
+  		DEFAULT_PORT += 1;
+  		if(address.indexOf(":") >= 0){
+  			String ip = address.split(":")[0];
+  			String port = address.split(":")[1];
+  			address = ip + ":" + (Integer.parseInt(port)+1);			
+  		}
+  	}
+  	  	
     return NetUtils.createSocketAddr(address, DEFAULT_PORT);
   }
 
@@ -163,9 +182,28 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
     this.namesystem = new FSNamesystem(this, conf);
     this.server.start();  //start RPC server   
 
+    // emptier below created a client and have it connect to this namenode using rpc
+    // so wrapper should be created before emptier 
+    if(conf.getBoolean("dfs.bft", false)){
+      //BftNamenodeGlue bng = new BftNamenodeGlue(conf, this);
+      //bng.initialize();
+      //BftNameNodeSmallGlue bnsg = new BftNameNodeSmallGlue(conf, this);
+      //bnsg.initialize();
+	//BftNamenodeWrapper wrapper = new BftNamenodeWrapper(conf);
+	//wrapper.initialize();
+    	
+    	// NEW General CP
+    	if(!isHelper){
+    		BftPrimaryGlue bpg = new BftPrimaryGlue(conf, this);
+    		bpg.initialize();
+    	}
+    }
+    
+    /*
     this.emptier = new Thread(new Trash(conf).getEmptier(), "Trash Emptier");
     this.emptier.setDaemon(true);
     this.emptier.start();
+    */
   }
     
   /**
@@ -205,6 +243,17 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
                   Configuration conf
                   ) throws IOException {
     try {
+    	boolean bft = conf.getBoolean("dfs.bft", false);
+    	if(bft){
+    		if(bindAddress.indexOf(":") >= 0){
+    			bindAddress = DNS.getDefaultIP("default")
+    			+ ":" + bindAddress.split(":")[1];
+    		} else {
+    			bindAddress = DNS.getDefaultIP("default");
+    		}
+    		
+    	}
+    	
       initialize(bindAddress, conf);
     } catch (IOException e) {
       this.stop();
@@ -274,6 +323,9 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
   }
   
   private static String getClientMachine() {
+  	if(FSNamesystem.bft == true){
+  		return "";
+  	}
     String clientMachine = Server.getRemoteAddress();
     if (clientMachine == null) {
       clientMachine = "";
@@ -300,7 +352,7 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
     }
     namesystem.startFile(src,
         new PermissionStatus(UserGroupInformation.getCurrentUGI().getUserName(),
-            null, masked),
+            "", masked),
         clientName, clientMachine, overwrite, replication, blockSize);
     myMetrics.numFilesCreated.inc();
     myMetrics.numCreateFileOps.inc();
@@ -351,7 +403,23 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
     LocatedBlock locatedBlock = namesystem.getAdditionalBlock(src, clientName);
     if (locatedBlock != null)
       myMetrics.numAddBlockOps.inc();
+    
     return locatedBlock;
+  }
+  
+  public LocatedBlock addBlock(String src,
+  		String clientName,
+  		byte[] hashOfPreviousBlock) throws IOException {
+
+  	stateChangeLog.debug("*BLOCK* NameNode.addBlock [bftdatanode]: file "
+  			+src+" for "+clientName);
+  	LOG.debug("[bft] addblock Hash Val : " + ((hashOfPreviousBlock!=null)?
+  			new MD5Hash(hashOfPreviousBlock).toString():""));
+  	LocatedBlock locatedBlock = namesystem.getAdditionalBlock(src, clientName, hashOfPreviousBlock);
+  	if (locatedBlock != null)
+  		myMetrics.numAddBlockOps.inc();
+
+  	return locatedBlock;
   }
 
   /**
@@ -363,6 +431,27 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
                          +b+" of file "+src);
     if (!namesystem.abandonBlock(b, src, holder)) {
       throw new IOException("Cannot abandon block during write to " + src);
+    }
+  }
+  
+  public boolean complete(String src,
+  																String clientName,
+  																byte[] hashOfLastBlock) throws IOException {
+    stateChangeLog.debug("*DIR* NameNode.complete [bftdatanode] : " + src + " for " + clientName);
+    if(hashOfLastBlock == null){
+    	LOG.debug("[bft] complete Hash Val : NULL ");
+    } else {
+    	LOG.debug("[bft] complete Hash Val : " +	
+    			new MD5Hash(hashOfLastBlock).toString());
+    }
+    
+    CompleteFileStatus returnCode = namesystem.completeFile(src, clientName, hashOfLastBlock);
+    if (returnCode == CompleteFileStatus.STILL_WAITING) {
+      return false;
+    } else if (returnCode == CompleteFileStatus.COMPLETE_SUCCESS) {
+      return true;
+    } else {
+      throw new IOException("Could not complete write to file " + src + " by " + clientName);
     }
   }
 
@@ -395,6 +484,11 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
         namesystem.markBlockAsCorrupt(blk, dn);
       }
     }
+    
+    if(FSNamesystem.bft & !namesystem.bftReplaying){
+      ((BftFSEditLog)namesystem.getEditLog()).bftLogReportBadBlocks(blocks);
+    }
+    
   }
 
   /** {@inheritDoc} */
@@ -470,7 +564,7 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
     }
     return namesystem.mkdirs(src,
         new PermissionStatus(UserGroupInformation.getCurrentUGI().getUserName(),
-            null, masked));
+            "", masked));
   }
 
   /**
@@ -634,10 +728,35 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
            +"from "+nodeReg.getName()+" "+blist.getNumberOfBlocks() +" blocks");
 
     namesystem.processReport(nodeReg, blist);
+  
+    if(FSNamesystem.bft & !namesystem.bftReplaying){
+      ((BftFSEditLog)namesystem.getEditLog()).bftLogBlockReport(nodeReg, blocks);
+    }
+    
     if (getFSImage().isUpgradeFinalized())
       return DatanodeCommand.FINALIZE;
     return null;
   }
+
+  public DatanodeCommand blockReport(DatanodeRegistration nodeReg,
+  		Block[] blocks) throws IOException {
+  	verifyRequest(nodeReg);
+  	//BlockListAsLongs blist = new BlockListAsLongs(blocks);
+  	stateChangeLog.debug("*BLOCK* NameNode.blockReport: "
+  			+"from "+nodeReg.getName()+" "+blocks.length +" blocks");
+
+  	namesystem.processReport(nodeReg, blocks);
+
+  	if(FSNamesystem.bft & !namesystem.bftReplaying){
+  		((BftFSEditLog)namesystem.getEditLog()).bftLogBlockReport(nodeReg, blocks);  		  		
+  	}
+
+  	if (getFSImage().isUpgradeFinalized())
+  		return DatanodeCommand.FINALIZE;
+  	return null;
+  }
+  
+  
 
   public void blockReceived(DatanodeRegistration nodeReg, 
                             Block blocks[],
@@ -648,6 +767,10 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
     for (int i = 0; i < blocks.length; i++) {
       namesystem.blockReceived(nodeReg, blocks[i], delHints[i]);
     }
+    if(FSNamesystem.bft & !namesystem.bftReplaying){
+      ((BftFSEditLog)namesystem.getEditLog()).bftLogBlockReceived(nodeReg, blocks, delHints);
+    }
+    
   }
 
   /**
@@ -732,6 +855,39 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
     return this.namesystem.clusterMap;
   }
 
+  /////////////////////////////////////////////////////
+  // BftWrapperNamenodeProtocol
+  /////////////////////////////////////////////////////
+
+  public String getEditLogName() throws IOException {
+	  return getFSImage().getEditLog().getFsEditName().getAbsolutePath();
+  }
+  public String getNewCPName () throws IOException {
+	  return getFSImage().getFsImageNameCheckpoint()[0].getAbsolutePath();
+  }
+  public File getImageName() throws IOException{
+	  return getFSImage().getFsImageName();
+  }
+
+
+  public void executeThreadFunctions() {
+	  namesystem.executeThreadFunctions();
+  }
+
+  public void setBftTime(long time) {
+	  BFTRandom.setBftTime(time);
+  }
+
+  public void reloadImage() throws IOException{
+
+	  if(namesystem !=null){
+		  namesystem.close();
+		  namesystem.shutdown();
+	  }
+	  namesystem = new FSNamesystem(this, new Configuration());
+  }
+
+
   /**
    * Verify that configured directories exist, then
    * Interactively confirm that formatting is desired 
@@ -764,6 +920,7 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
 
     FSNamesystem nsys = new FSNamesystem(new FSImage(dirsToFormat,
                                          editDirsToFormat), conf);
+    
     nsys.dir.fsImage.format();
     return false;
   }
@@ -864,6 +1021,31 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
    */
   public static void main(String argv[]) throws Exception {
     try {
+    	String shimid="";
+    	String upRightConfigFile="";
+    	if(argv.length>0){
+    		LinkedList<String> ll = new LinkedList<String>();
+    		for(int i=0; i < argv.length; i++){
+    			String arg = argv[i];
+    			if(arg.equalsIgnoreCase("-helper")){
+    				System.out.println("Helper NameNode");
+    				isHelper = true;
+    			} else if (arg.equalsIgnoreCase("-shimid")){
+    				shimid = argv[i+1];
+    				i++;
+    			} else if (arg.equalsIgnoreCase("-UpRightConfig")){
+    				upRightConfigFile = argv[i+1];
+    				i++;
+    			} else {
+    				if(arg!=null)
+    					ll.add(arg);
+    			}
+    		}
+    		argv = ll.toArray(new String[0]);
+    	}
+    	System.setProperty("UpRightShimID", shimid);
+    	System.setProperty("UpRightConfigFile", upRightConfigFile);
+
       StringUtils.startupShutdownMessage(NameNode.class, argv, LOG);
       NameNode namenode = createNameNode(argv, null);
       if (namenode != null)
@@ -873,4 +1055,12 @@ public class NameNode implements ClientProtocol, DatanodeProtocol,
       System.exit(-1);
     }
   }
+
+	@Override
+	public boolean confirmBlockUpdate(String clientAddr, Block block)
+			throws IOException {
+		return namesystem.confirmBlockUpdate(clientAddr, block);
+	}
+
+	
 }

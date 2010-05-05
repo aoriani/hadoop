@@ -130,21 +130,20 @@ public interface FSDatasetInterface extends FSDatasetMBean {
   public BlockInputStreams getTmpInputStreams(Block b, long blkoff, long ckoff)
             throws IOException;
 
-     /**
-      * 
-      * This class contains the output streams for the data and checksum
-      * of a block
-      *
-      */
-     static class BlockWriteStreams {
-      OutputStream dataOut;
-      OutputStream checksumOut;
-      BlockWriteStreams(OutputStream dOut, OutputStream cOut) {
-        dataOut = dOut;
-        checksumOut = cOut;
-      }
-      
-    }
+  /**
+   * 
+   * This class contains the output streams for the data and checksum
+   * of a block
+   *
+   */
+  static class BlockWriteStreams {
+  	OutputStream dataOut;
+  	OutputStream checksumOut;
+  	BlockWriteStreams(OutputStream dOut, OutputStream cOut) {
+  		dataOut = dOut;
+  		checksumOut = cOut;
+  	}            
+  }
 
   /**
    * This class contains the input streams for the data and checksum
@@ -164,7 +163,7 @@ public interface FSDatasetInterface extends FSDatasetMBean {
       IOUtils.closeStream(dataIn);
       IOUtils.closeStream(checksumIn);
     }
-  }
+  }  
     
   /**
    * Creates the block and returns output streams to write data and CRC

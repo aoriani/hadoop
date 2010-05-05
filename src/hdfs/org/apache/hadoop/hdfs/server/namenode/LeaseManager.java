@@ -274,6 +274,14 @@ public class LeaseManager {
       paths.remove(new StringBytesWritable(oldpath));
       paths.add(new StringBytesWritable(newpath));
     }
+    
+    void setLastUpdate(long t){
+    	lastUpdate = t;
+    }
+    
+    long getLastUpdate(){
+    	return lastUpdate;
+    }
   }
 
   synchronized void changeLease(String src, String dst,

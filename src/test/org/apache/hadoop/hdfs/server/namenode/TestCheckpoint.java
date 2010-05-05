@@ -44,8 +44,8 @@ public class TestCheckpoint extends TestCase {
   static final long seed = 0xDEADBEEFL;
   static final int blockSize = 4096;
   static final int fileSize = 8192;
-  static final int numDatanodes = 3;
-  short replication = 3;
+  static final int numDatanodes = 1;
+  short replication = 1;
 
   private void writeFile(FileSystem fileSys, Path name, int repl)
     throws IOException {
@@ -567,10 +567,11 @@ public class TestCheckpoint extends TestCase {
 
     Configuration conf = new Configuration();
     conf.set("dfs.secondary.http.address", "0.0.0.0:0");
-    replication = (short)conf.getInt("dfs.replication", 3);  
+    //replication = (short)conf.getInt("dfs.replication", 3);  
     MiniDFSCluster cluster = new MiniDFSCluster(conf, numDatanodes, true, null);
     cluster.waitActive();
     FileSystem fileSys = cluster.getFileSystem();
+    FSNamesystem fsNamesys = cluster.getNameNode().namesystem;
 
     try {
       //
@@ -612,7 +613,9 @@ public class TestCheckpoint extends TestCase {
       // create new file file2
       writeFile(fileSys, file2, replication);
       checkFile(fileSys, file2, replication);
-
+      
+      fsNamesys = cluster.getNameNode().namesystem;
+      fsNamesys.metaSave("dump1");
       //
       // Take a checkpoint
       //
@@ -632,6 +635,8 @@ public class TestCheckpoint extends TestCase {
     cluster.waitActive();
     fileSys = cluster.getFileSystem();
 
+    fsNamesys = cluster.getNameNode().namesystem;
+    fsNamesys.metaSave("dump2");
     assertTrue(!fileSys.exists(file1));
 
     try {
@@ -643,12 +648,12 @@ public class TestCheckpoint extends TestCase {
     }
 
     // file2 is left behind.
-
+    /*
     testSecondaryNamenodeError1(conf);
     testSecondaryNamenodeError2(conf);
     testSecondaryNamenodeError3(conf);
     testNamedirError(conf, namedirs);
     testSecondaryFailsToReturnImage(conf);
-    testStartup(conf);
+    testStartup(conf);*/
   }
 }

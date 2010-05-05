@@ -20,6 +20,7 @@ package org.apache.hadoop.hdfs.server.namenode;
 import org.apache.commons.logging.*;
 
 import org.apache.hadoop.conf.*;
+import org.apache.hadoop.hdfs.BFTRandom;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.*;
 import org.apache.hadoop.hdfs.server.common.GenerationStamp;
@@ -27,6 +28,7 @@ import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
 import org.apache.hadoop.hdfs.server.common.Storage;
 import org.apache.hadoop.hdfs.server.common.UpgradeStatusReport;
 import org.apache.hadoop.hdfs.server.namenode.BlocksMap.BlockInfo;
+import org.apache.hadoop.hdfs.server.namenode.FSImage.NameNodeDirType;
 import org.apache.hadoop.hdfs.server.namenode.metrics.FSNamesystemMBean;
 import org.apache.hadoop.hdfs.server.namenode.metrics.FSNamesystemMetrics;
 import org.apache.hadoop.security.AccessControlException;
@@ -54,8 +56,14 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.*;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.MD5Hash;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
 
 import java.io.BufferedWriter;
+import java.io.DataInput;
+import java.io.DataInputStream;
+import java.io.DataOutput;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.FileNotFoundException;
@@ -118,7 +126,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   public static final Log auditLog = LogFactory.getLog(
       FSNamesystem.class.getName() + ".audit");
 
-  private boolean isPermissionEnabled;
+  protected boolean isPermissionEnabled;
   private UserGroupInformation fsOwner;
   private String supergroup;
   private PermissionStatus defaultPermission;
@@ -188,6 +196,14 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     new TreeMap<String, Collection<Block>>();
 
   //
+  // Keep blocks whose hash value has not been verified 
+  //
+  private Map<Block, LinkedList<Object[]>> undecidedBlocks =
+  	new TreeMap<Block, LinkedList<Object[]>>();
+  
+  
+  
+  //
   // For the HTTP browsing interface
   //
   HttpServer infoServer;
@@ -195,7 +211,8 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   Date startTime;
     
   //
-  Random r = new Random();
+  //Random r = new Random();
+  Random r = BFTRandom.getRandom();
 
   /**
    * Stores a set of DatanodeDescriptor objects.
@@ -212,7 +229,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   // Set of: Block
   //
   private UnderReplicatedBlocks neededReplications = new UnderReplicatedBlocks();
-  private PendingReplicationBlocks pendingReplications;
+  protected PendingReplicationBlocks pendingReplications;
 
   public LeaseManager leaseManager = new LeaseManager(this); 
 
@@ -233,6 +250,8 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   //  How many outgoing replication streams a given node should have at one time
   private int maxReplicationStreams;
   // MIN_REPLICATION is how many copies we need in place or else we disallow the write
+  // (UpRight DataNode: We use this parameter as the anticipated number of 
+  // matching hashes reported from DataNodes to proceed with safety assurance) 
   private int minReplication;
   // Default replication
   private int defaultReplication;
@@ -282,10 +301,21 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   // precision of access times.
   private long accessTimePrecision = 0;
 
+  static public boolean bft = true;
+  static public boolean bftdatanode;
+  
+  boolean bftReplaying;
+  //static boolean log_fault_inject =false;
+  
+  
   /**
    * FSNamesystem constructor.
    */
   FSNamesystem(NameNode nn, Configuration conf) throws IOException {
+  	bft = conf.getBoolean("dfs.bft", false);
+  	bftdatanode = conf.getBoolean("dfs.bft.datanode", false);
+  	//log_fault_inject = conf.getBoolean("exp.log_fault", false);
+  	//if(conf.getInt("bft.shimId",0) != 0) log_fault_inject = false;
     try {
       initialize(nn, conf);
     } catch(IOException e) {
@@ -299,10 +329,22 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
    * Initialize FSNamesystem.
    */
   private void initialize(NameNode nn, Configuration conf) throws IOException {
+
     this.systemStart = now();
     this.startTime = new Date(systemStart); 
     setConfigurationParameters(conf);
 
+    this.dnsToSwitchMapping = ReflectionUtils.newInstance(
+        conf.getClass("topology.node.switch.mapping.impl", ScriptBasedMapping.class,
+            DNSToSwitchMapping.class), conf);
+    
+    pendingReplications = new PendingReplicationBlocks(
+        conf.getInt("dfs.replication.pending.timeout.sec", 
+                    -1) * 1000L);
+    
+    this.hostsReader = new HostsFileReader(conf.get("dfs.hosts",""),
+        conf.get("dfs.hosts.exclude",""));
+    
     this.localMachine = nn.getNameNodeAddress().getHostName();
     this.port = nn.getNameNodeAddress().getPort();
     this.registerMBean(conf); // register the MBean for the FSNamesystemStutus
@@ -314,26 +356,36 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     LOG.info("Finished loading FSImage in " + timeTakenToLoadFSImage + " msecs");
     NameNode.getNameNodeMetrics().fsImageLoadTime.set(
                               (int) timeTakenToLoadFSImage);
-    this.safeMode = new SafeModeInfo(conf);
-    setBlockTotal();
-    pendingReplications = new PendingReplicationBlocks(
-                            conf.getInt("dfs.replication.pending.timeout.sec", 
-                                        -1) * 1000L);
-    this.hbthread = new Daemon(new HeartbeatMonitor());
-    this.lmthread = new Daemon(leaseManager.createMonitor());
-    this.replthread = new Daemon(new ReplicationMonitor());
-    hbthread.start();
-    lmthread.start();
-    replthread.start();
+    if(safeMode == null && heartbeats.size() == 0){
+      this.safeMode = new SafeModeInfo(conf);
+      setBlockTotal();
+    }
+    
+    /*
+     * If UpRight NameNode is used, disable threads running on background 
+     */
+    if(bft)
+    	fsRunning = false;
+    
+    //pendingReplications = new PendingReplicationBlocks(
+    //                        conf.getInt("dfs.replication.pending.timeout.sec", 
+    //                                    -1) * 1000L);
+    if(!bft){
+    	this.hbthread = new Daemon(new HeartbeatMonitor());
+    	this.lmthread = new Daemon(leaseManager.createMonitor());
+    	this.replthread = new Daemon(new ReplicationMonitor());
+    	hbthread.start();
+    	lmthread.start();
+    	replthread.start();
 
-    this.hostsReader = new HostsFileReader(conf.get("dfs.hosts",""),
-                                           conf.get("dfs.hosts.exclude",""));
-    this.dnthread = new Daemon(new DecommissionedMonitor());
-    dnthread.start();
-
-    this.dnsToSwitchMapping = ReflectionUtils.newInstance(
-        conf.getClass("topology.node.switch.mapping.impl", ScriptBasedMapping.class,
-            DNSToSwitchMapping.class), conf);
+    	//this.hostsReader = new HostsFileReader(conf.get("dfs.hosts",""),
+    	//                                       conf.get("dfs.hosts.exclude",""));
+    	this.dnthread = new Daemon(new DecommissionedMonitor());
+    	dnthread.start();
+    }
+    //this.dnsToSwitchMapping = ReflectionUtils.newInstance(
+    //    conf.getClass("topology.node.switch.mapping.impl", ScriptBasedMapping.class,
+    //        DNSToSwitchMapping.class), conf);
     
     /* If the dns to swith mapping supports cache, resolve network 
      * locations of those hosts in the include list, 
@@ -343,45 +395,46 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     if (dnsToSwitchMapping instanceof CachedDNSToSwitchMapping) {
       dnsToSwitchMapping.resolve(new ArrayList<String>(hostsReader.getHosts()));
     }
+    if(!NameNode.isHelper){
+    	String infoAddr = 
+    		NetUtils.getServerAddress(conf, "dfs.info.bindAddress", 
+    				"dfs.info.port", "dfs.http.address");
+    	InetSocketAddress infoSocAddr = NetUtils.createSocketAddr(infoAddr);
+    	String infoHost = infoSocAddr.getHostName();
+    	int tmpInfoPort = infoSocAddr.getPort();
+    	this.infoServer = new HttpServer("hdfs", infoHost, tmpInfoPort, 
+    			tmpInfoPort == 0, conf);
+    	InetSocketAddress secInfoSocAddr = NetUtils.createSocketAddr(
+    			conf.get("dfs.https.address", infoHost + ":" + 0));
+    	Configuration sslConf = new Configuration(conf);
+    	sslConf.addResource(conf.get("https.keystore.info.rsrc", "sslinfo.xml"));
+    	String keyloc = sslConf.get("https.keystore.location");
+    	if (null != keyloc) {
+    		this.infoServer.addSslListener(secInfoSocAddr, keyloc,
+    				sslConf.get("https.keystore.password", ""),
+    				sslConf.get("https.keystore.keypassword", ""));
+    	}
+    	// assume same ssl port for all datanodes
+    	InetSocketAddress datanodeSslPort = NetUtils.createSocketAddr(
+    			conf.get("dfs.datanode.https.address", infoHost + ":" + 50475));
+    	this.infoServer.setAttribute("datanode.https.port",
+    			datanodeSslPort.getPort());
+    	this.infoServer.setAttribute("name.node", nn);
+    	this.infoServer.setAttribute("name.system.image", getFSImage());
+    	this.infoServer.setAttribute("name.conf", conf);
+    	this.infoServer.addInternalServlet("fsck", "/fsck", FsckServlet.class);
+    	this.infoServer.addInternalServlet("getimage", "/getimage", GetImageServlet.class);
+    	this.infoServer.addInternalServlet("listPaths", "/listPaths/*", ListPathsServlet.class);
+    	this.infoServer.addInternalServlet("data", "/data/*", FileDataServlet.class);
+    	this.infoServer.addInternalServlet("checksum", "/fileChecksum/*",
+    			FileChecksumServlets.RedirectServlet.class);
+    	this.infoServer.start();
 
-    String infoAddr = 
-      NetUtils.getServerAddress(conf, "dfs.info.bindAddress", 
-                                "dfs.info.port", "dfs.http.address");
-    InetSocketAddress infoSocAddr = NetUtils.createSocketAddr(infoAddr);
-    String infoHost = infoSocAddr.getHostName();
-    int tmpInfoPort = infoSocAddr.getPort();
-    this.infoServer = new HttpServer("hdfs", infoHost, tmpInfoPort, 
-        tmpInfoPort == 0, conf);
-    InetSocketAddress secInfoSocAddr = NetUtils.createSocketAddr(
-        conf.get("dfs.https.address", infoHost + ":" + 0));
-    Configuration sslConf = new Configuration(conf);
-    sslConf.addResource(conf.get("https.keystore.info.rsrc", "sslinfo.xml"));
-    String keyloc = sslConf.get("https.keystore.location");
-    if (null != keyloc) {
-      this.infoServer.addSslListener(secInfoSocAddr, keyloc,
-          sslConf.get("https.keystore.password", ""),
-          sslConf.get("https.keystore.keypassword", ""));
+    	// The web-server port can be ephemeral... ensure we have the correct info
+    	this.infoPort = this.infoServer.getPort();
+    	conf.set("dfs.http.address", infoHost + ":" + infoPort);
+    	LOG.info("Web-server up at: " + infoHost + ":" + infoPort);
     }
-    // assume same ssl port for all datanodes
-    InetSocketAddress datanodeSslPort = NetUtils.createSocketAddr(
-        conf.get("dfs.datanode.https.address", infoHost + ":" + 50475));
-    this.infoServer.setAttribute("datanode.https.port",
-        datanodeSslPort.getPort());
-    this.infoServer.setAttribute("name.node", nn);
-    this.infoServer.setAttribute("name.system.image", getFSImage());
-    this.infoServer.setAttribute("name.conf", conf);
-    this.infoServer.addInternalServlet("fsck", "/fsck", FsckServlet.class);
-    this.infoServer.addInternalServlet("getimage", "/getimage", GetImageServlet.class);
-    this.infoServer.addInternalServlet("listPaths", "/listPaths/*", ListPathsServlet.class);
-    this.infoServer.addInternalServlet("data", "/data/*", FileDataServlet.class);
-    this.infoServer.addInternalServlet("checksum", "/fileChecksum/*",
-        FileChecksumServlets.RedirectServlet.class);
-    this.infoServer.start();
-
-    // The web-server port can be ephemeral... ensure we have the correct info
-    this.infoPort = this.infoServer.getPort();
-    conf.set("dfs.http.address", infoHost + ":" + infoPort);
-    LOG.info("Web-server up at: " + infoHost + ":" + infoPort);
   }
 
   public static Collection<File> getNamespaceDirs(Configuration conf) {
@@ -390,6 +443,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       dirNames.add("/tmp/hadoop/dfs/name");
     Collection<File> dirs = new ArrayList<File>(dirNames.size());
     for(String name : dirNames) {
+    	if(NameNode.isHelper) name += "_helper";
       dirs.add(new File(name));
     }
     return dirs;
@@ -402,6 +456,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       editsDirNames.add("/tmp/hadoop/dfs/name");
     Collection<File> dirs = new ArrayList<File>(editsDirNames.size());
     for(String name : editsDirNames) {
+    	if(NameNode.isHelper) name += "_helper";
       dirs.add(new File(name));
     }
     return dirs;
@@ -412,8 +467,23 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
    * is stored
    */
   FSNamesystem(FSImage fsImage, Configuration conf) throws IOException {
+  	bft = conf.getBoolean("dfs.bft", false);
+  	bftdatanode = conf.getBoolean("dfs.bft.datanode", false);
     setConfigurationParameters(conf);
     this.dir = new FSDirectory(fsImage, this, conf);
+    
+    this.dnsToSwitchMapping = ReflectionUtils.newInstance(
+        conf.getClass("topology.node.switch.mapping.impl", ScriptBasedMapping.class,
+            DNSToSwitchMapping.class), conf);
+    
+    pendingReplications = new PendingReplicationBlocks(
+        conf.getInt("dfs.replication.pending.timeout.sec", 
+                    -1) * 1000L);
+    this.hostsReader = new HostsFileReader(conf.get("dfs.hosts",""),
+        conf.get("dfs.hosts.exclude",""));
+    if (dnsToSwitchMapping instanceof CachedDNSToSwitchMapping) {
+      dnsToSwitchMapping.resolve(new ArrayList<String>(hostsReader.getHosts()));
+    }
   }
 
   /**
@@ -422,6 +492,10 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   private void setConfigurationParameters(Configuration conf) 
                                           throws IOException {
     fsNamesystemObject = this;
+        
+    
+    
+    
     try {
       fsOwner = UnixUserGroupInformation.login(conf);
     } catch (LoginException e) {
@@ -640,6 +714,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       return new BlocksWithLocations(new BlockWithLocations[0]);
     }
     Iterator<Block> iter = node.getBlockIterator();
+    //r = BFTRandom.getRandom();
     int startBlock = r.nextInt(numBlocks); // starting from a random block
     // skip blocks
     for(int i=0; i<startBlock; i++) {
@@ -700,6 +775,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     checkOwner(src);
     dir.setPermission(src, permission);
     getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogSetPermission(src, permission);
+    }
+    
     if (auditLog.isInfoEnabled()) {
       final FileStatus stat = dir.getFileInfo(src);
       logAuditEvent(UserGroupInformation.getCurrentUGI(),
@@ -726,6 +806,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     }
     dir.setOwner(src, username, group);
     getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogSetOwner(src, username, group);
+    }
+    
     if (auditLog.isInfoEnabled()) {
       final FileStatus stat = dir.getFileInfo(src);
       logAuditEvent(UserGroupInformation.getCurrentUGI(),
@@ -744,6 +829,12 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     if (isPermissionEnabled) {
       checkPathAccess(src, FsAction.READ);
     }
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogGetBlockLocations(now(), 
+      		clientMachine, src, offset, length);
+    }
+    
 
     LocatedBlocks blocks = getBlockLocations(src, offset, length, true);
     if (blocks != null) {
@@ -754,6 +845,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
         clusterMap.pseudoSortByDistance(client, b.getLocations());
       }
     }
+    
     return blocks;
   }
 
@@ -890,6 +982,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     } else {
       throw new FileNotFoundException("File " + src + " does not exist.");
     }
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogSetTimes(src, mtime, atime);
+    }
+    
   }
 
   /**
@@ -909,6 +1006,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                                 throws IOException {
     boolean status = setReplicationInternal(src, replication);
     getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogSetReplication(src, replication);
+    }
+    
     if (status && auditLog.isInfoEnabled()) {
       logAuditEvent(UserGroupInformation.getCurrentUGI(),
                     Server.getRemoteIp(),
@@ -995,6 +1097,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     startFileInternal(src, permissions, holder, clientMachine, overwrite, false,
                       replication, blockSize);
     getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogStartFile(now(),src, permissions, holder, clientMachine, overwrite, replication, blockSize);
+    }
+    
     if (auditLog.isInfoEnabled()) {
       final FileStatus stat = dir.getFileInfo(src);
       logAuditEvent(UserGroupInformation.getCurrentUGI(),
@@ -1020,7 +1127,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           + ", overwrite=" + overwrite
           + ", append=" + append);
     }
-
+    
     if (isInSafeMode())
       throw new SafeModeException("Cannot create file" + src, safeMode);
     if (!DFSUtil.isValidName(src)) {
@@ -1034,7 +1141,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
         checkAncestorAccess(src, FsAction.WRITE);
       }
     }
-
+    
     try {
       INode myFile = dir.getFileINode(src);
       if (myFile != null && myFile.isUnderConstruction()) {
@@ -1078,7 +1185,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                                                pendingFile.getClientName() + 
                                                " on " + pendingFile.getClientMachine());
       }
-
+     
       try {
         verifyReplication(src, replication, clientMachine);
       } catch(IOException e) {
@@ -1101,10 +1208,10 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                                 +" either because the filename is invalid or the file exists");
         }
       }
-
+      
       DatanodeDescriptor clientNode = 
         host2DataNodeMap.getDatanodeByHost(clientMachine);
-
+      
       if (append) {
         //
         // Replace current node with a INodeUnderConstruction.
@@ -1129,16 +1236,18 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
        // blocks associated with it.
        //
        checkFsObjectLimit();
-
+       
         // increment global generation stamp
         long genstamp = nextGenerationStamp();
         INodeFileUnderConstruction newNode = dir.addFile(src, permissions,
             replication, blockSize, holder, clientMachine, clientNode, genstamp);
+        
         if (newNode == null) {
           throw new IOException("DIR* NameSystem.startFile: " +
                                 "Unable to add file to namespace.");
         }
         leaseManager.addLease(newNode.clientName, src);
+        
         if (NameNode.stateChangeLog.isDebugEnabled()) {
           NameNode.stateChangeLog.debug("DIR* NameSystem.startFile: "
                                      +"add "+src+" to namespace for "+holder);
@@ -1149,6 +1258,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                                    +ie.getMessage());
       throw ie;
     }
+    
   }
 
   /**
@@ -1164,6 +1274,10 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     startFileInternal(src, null, holder, clientMachine, false, true, 
                       (short)maxReplication, (long)0);
     getEditLog().logSync();
+    
+    if(bft && bftReplaying ){
+      ((BftFSEditLog)getEditLog()).bftLogAppend(now(), src, holder, clientMachine);
+    }
 
     //
     // Create a LocatedBlock object for the last block of the file
@@ -1185,6 +1299,16 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           for (int i = 0; it != null && it.hasNext(); i++) {
             targets[i] = it.next();
           }
+          if(bftdatanode){
+          	// reorder datanodes
+          	// This is for client's retry when it failed append due to a faulty datanode
+          	int n = r.nextInt(targets.length);
+          	DatanodeDescriptor[] targets2 = new DatanodeDescriptor[targets.length];
+          	for(int i=0; i<n; i++){
+          		targets2[i] = targets[(i+n)%targets.length];
+          	}
+          	targets = targets2;
+          }
           lb = new LocatedBlock(last, targets, 
                                 fileLength-storedBlock.getNumBytes());
 
@@ -1196,6 +1320,13 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           //
           for(Collection<Block> v : recentInvalidateSets.values()) {
             v.remove(last);
+          }
+          if(bftdatanode){
+          	// remember the original hash of the appended block 
+          	// to handle rolling back to original block  
+          	INodeFileUnderConstruction f = (INodeFileUnderConstruction)file;
+          	f.previousHash = storedBlock.getHash();
+          	storedBlock.setHash(null);
           }
         }
       }
@@ -1216,6 +1347,142 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     }
     return lb;
   }
+  
+  /**
+   * Set hash of the immediately preceding block.
+   * This is called by getAdditionalBlock() for non-last blocks 
+   * or completeFile() for the last block.
+   * For Append, hdfs clients send hash of only appended data instead
+   * of hash of whole block. This hash is used only for finding matching
+   * quorum of hashes from datanodes (Datanodes send both hash of appended data
+   * and hash of whole block).  The hash of whole block from datanodes is
+   * stored on namenode iff there exists quorum of them.
+   * @param src
+   * @param clientName
+   * @param hashOfPreviousBlock
+   */
+  void setHashOfBlock(String src, String clientName,
+		  byte[] hashOfPreviousBlock){
+	  assert bftdatanode;
+	  INode iFile = dir.getFileINode(src);
+	  
+	  Block[] fileBlocks = null;
+
+	  if (iFile != null && iFile.isUnderConstruction()) {
+		  fileBlocks =  dir.getFileBlocks(src);
+	  } else {
+		  LOG.info("INode is missing for " + src);
+		  fileBlocks =  dir.getFileBlocks(src);
+		  if(fileBlocks == null) return;
+//		  System.out.println("!!! This must not happen!!");
+//		  System.exit(-1);
+//		  return;
+	  }
+
+	  if(fileBlocks.length <= 0){
+		  // this request is for the first block
+		  return;
+	  }
+
+	  Block previousBlock = fileBlocks[fileBlocks.length-1];
+	  assert hashOfPreviousBlock != null;
+	  previousBlock.setAddedHash(hashOfPreviousBlock);
+	  blocksMap.getStoredBlock(previousBlock).setAddedHash(hashOfPreviousBlock);
+	  LOG.debug("[BFT] Set addedHash for block: "+ previousBlock.getBlockId()
+			  + " to " + (new MD5Hash(hashOfPreviousBlock)).toString());
+
+	  //
+	  // Process the buffered reports for received block from datanode
+	  //  	  	
+	  synchronized(undecidedBlocks){
+		  if( undecidedBlocks.containsKey(previousBlock)){
+			  LinkedList<Object[]> tripletList = null;
+			  tripletList = undecidedBlocks.get(previousBlock);
+			  if(tripletList.size() < this.minReplication) return;
+
+			  HashMap<MD5Hash,Integer> quorumCheck = new HashMap<MD5Hash,Integer>();
+
+			  LinkedList<Object[]> successList = new LinkedList<Object[]>();
+			  for(Object[] triplet : tripletList){
+				  Block b = (Block)triplet[0];
+				  // if block is appended, use hash of the appended part 
+				  // for comparison against one from a client
+				  byte[] hash = ((b.getAddedHash()==null)?b.getHash():b.getAddedHash());
+				  if(Arrays.equals(hashOfPreviousBlock, hash)){
+					  LOG.debug("[BFT] found buffered block that matches this hash : " + b);
+					  // hashes matches.. add this block
+					  successList.add(triplet);
+					  MD5Hash key = new MD5Hash(b.getHash());
+					  if(quorumCheck.containsKey(key)){
+						  int prev = quorumCheck.get(key);
+						  quorumCheck.put(key, prev+1);
+					  } else {
+						  quorumCheck.put(key, 1);
+					  }  					
+				  } else {
+					  LOG.info("[BFT] found buffered block that does NOT match this hash : " + b);
+					  LOG.debug( "choosen Hash : " + (new MD5Hash(hash).toString()));
+					  LOG.debug( "Hash from client : " + (new MD5Hash(hashOfPreviousBlock).toString()));
+					  LOG.debug(" node " + ((DatanodeDescriptor)triplet[1]).getHost() + " thinks the hash is "
+							  + (new MD5Hash(b.getHash()).toString()));
+					  // wrong replica.. invalidate this block
+					  addToInvalidates(b,(DatanodeDescriptor)triplet[1]);
+				  }
+			  }
+			  int max = 0;
+			  MD5Hash maxHash = null;
+			  for(MD5Hash hash : quorumCheck.keySet()){
+				  int numReply = quorumCheck.get(hash);
+				  if(numReply >= max){
+					  max = numReply;
+					  maxHash = hash;
+				  }
+			  }
+
+			  if(max < this.minReplication){
+				  undecidedBlocks.put(previousBlock, successList);
+			  } else {
+				  LOG.debug("quorum is established. size : "+this.minReplication);
+				  for(Object[] triplet : successList){
+					  Block b = (Block)triplet[0];
+					  if(Arrays.equals(b.getHash(),maxHash.getDigest())){
+						  addStoredBlock(b,
+								  (DatanodeDescriptor)triplet[1],(DatanodeDescriptor)triplet[2]);
+					  }
+				  }
+				  undecidedBlocks.remove(previousBlock);
+				  blocksMap.getStoredBlock(previousBlock).setHash(maxHash.getDigest());
+				  blocksMap.getStoredBlock(previousBlock).setAddedHash(null);
+			  }  			  		
+		  }
+	  }
+
+  }
+  
+  /**
+   * getAdditionalBlock() for BFT Datanode support. 
+   * This has an additional argument - hash of the immediately
+   * preceding block.
+   */
+  public LocatedBlock getAdditionalBlock(String src,
+  																		String clientName,
+  																		byte[] hashOfPreviousBlock) throws IOException {
+
+  	setHashOfBlock(src, clientName, hashOfPreviousBlock);
+  	
+  	LocatedBlock ret = getAdditionalBlockInternal(src,clientName);
+  	
+    if(bft & !bftReplaying){
+    	if(hashOfPreviousBlock == null){
+    		// For first block of a file, we put a place-holder to log this.
+    		hashOfPreviousBlock = new byte[MD5Hash.MD5_LEN];
+    	}
+      ((BftFSEditLog)getEditLog()).bftLogAddBlock(now(), src, clientName, ret.getBlock(),
+      		ret.getLocations(), hashOfPreviousBlock);
+    }
+  	
+  	return ret;
+  }
 
   /**
    * The client would like to obtain an additional block for the indicated
@@ -1231,6 +1498,18 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   public LocatedBlock getAdditionalBlock(String src, 
                                          String clientName
                                          ) throws IOException {
+  	LocatedBlock ret = getAdditionalBlockInternal(src, clientName);
+  	
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogAddBlock(now(), src, clientName,
+      		ret.getBlock(), ret.getLocations());
+    }
+    
+    return ret;
+  }
+  
+  private LocatedBlock getAdditionalBlockInternal(String src, String clientName)
+  		throws IOException {
     long fileLength, blockSize;
     int replication;
     DatanodeDescriptor clientNode = null;
@@ -1248,7 +1527,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       checkFsObjectLimit();
 
       INodeFileUnderConstruction pendingFile  = checkLease(src, clientName);
-
+      LOG.debug("Checking Lease Ended");
       //
       // If we fail this, bad things happen!
       //
@@ -1262,10 +1541,18 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     }
 
     // choose targets for the new block tobe allocated.
+    LOG.debug("Before chooseTarget");
+    LOG.debug("Topology : " + clusterMap.toString());
     DatanodeDescriptor targets[] = replicator.chooseTarget(replication,
                                                            clientNode,
                                                            null,
                                                            blockSize);
+    LOG.debug("After chooseTarget");
+    for(DatanodeDescriptor dd : targets){
+    	LOG.debug(dd.toString());
+    }
+    
+    
     if (targets.length < this.minReplication) {
       throw new IOException("File " + src + " could only be replicated to " +
                             targets.length + " nodes, instead of " +
@@ -1290,13 +1577,59 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       
       for (DatanodeDescriptor dn : targets) {
         dn.incBlocksScheduled();
+        dn.setXceiverCount(dn.getXceiverCount()+2);
+        synchronized (heartbeats) {
+          this.totalLoad +=2;
+        }        
       }      
     }
-        
+
     // Create next block
     return new LocatedBlock(newBlock, targets, fileLength);
   }
-
+  
+  /**
+   * getAddtionalBlock() used when replaying the edit logs
+   * 	
+   */
+  @Deprecated
+  public void bftGetAddtionalBlock(String src, String clientName,
+  		Block newBlock, String[] sids) throws IOException{
+    
+    DatanodeDescriptor[] targetDescriptors = new DatanodeDescriptor[sids.length];
+    
+    for(int i=0; i < sids.length; i++){
+      targetDescriptors[i] = datanodeMap.get(sids[i]);
+    }
+    
+    // Allocate a new block and record it in the INode. 
+    synchronized (this) {
+      INode[] pathINodes = dir.getExistingPathINodes(src);
+      int inodesLen = pathINodes.length;
+      checkLease(src, clientName, pathINodes[inodesLen-1]);
+      INodeFileUnderConstruction pendingFile  = (INodeFileUnderConstruction) 
+                                                pathINodes[inodesLen - 1];
+                                                           
+      if (!checkFileProgress(pendingFile, false)) {
+        throw new NotReplicatedYetException("Not replicated yet:" + src);
+      }
+      
+      newBlock = dir.addBlock(src, pathINodes, newBlock);
+            
+      pendingFile.setTargets(targetDescriptors);
+      
+      for (DatanodeDescriptor dn : targetDescriptors) {
+        dn.incBlocksScheduled();
+        dn.setXceiverCount(dn.getXceiverCount()+2);
+        synchronized (heartbeats) {
+          this.totalLoad +=2;
+        } 
+      }      
+    }
+    
+  }
+  
+  
   /**
    * The client would like to let go of the given block
    */
@@ -1309,6 +1642,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                                   +b+"of file "+src);
     INodeFileUnderConstruction file = checkLease(src, holder);
     dir.removeBlock(src, file, b);
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogAbandonBlock(b, src, holder);
+    }
+    
     NameNode.stateChangeLog.debug("BLOCK* NameSystem.abandonBlock: "
                                     + b
                                     + " is removed from pendingCreates");
@@ -1360,10 +1698,34 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     STILL_WAITING,
     COMPLETE_SUCCESS
   }
+  /**
+   * completeFile() for BFT Datanode support. 
+   * This has an additional argument - hash of the immediately
+   * preceding block.
+   */
+  public CompleteFileStatus completeFile(String src, String holder,
+  		byte[] hashOfLastBlock) throws IOException {
+  	
+  	setHashOfBlock(src, holder, hashOfLastBlock);
+    CompleteFileStatus status = completeFileInternal(src, holder);
+    getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogComplete(src, holder, hashOfLastBlock);
+    }
+    
+    return status;
+
+  }
   
   public CompleteFileStatus completeFile(String src, String holder) throws IOException {
     CompleteFileStatus status = completeFileInternal(src, holder);
     getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogComplete(src, holder);
+    }
+    
     return status;
   }
 
@@ -1423,7 +1785,8 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     }
   }
 
-  static Random randBlockId = new Random();
+  //static Random randBlockId = new Random();
+  static Random randBlockId = BFTRandom.getRandom();
     
   /**
    * Allocate a block at the given pending filename
@@ -1433,6 +1796,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
    *        <code>inodes[inodes.length-1]</code> is the INode for the file.
    */
   private Block allocateBlock(String src, INode[] inodes) throws IOException {
+  	//randBlockId = BFTRandom.getRandom();
     Block b = null;
     do {
       b = new Block(FSNamesystem.randBlockId.nextLong(), 0, 
@@ -1480,7 +1844,8 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   private void addToInvalidates(Block b, DatanodeInfo n) {
     Collection<Block> invalidateSet = recentInvalidateSets.get(n.getStorageID());
     if (invalidateSet == null) {
-      invalidateSet = new HashSet<Block>();
+      //invalidateSet = new HashSet<Block>();
+      invalidateSet = new TreeSet<Block>();
       recentInvalidateSets.put(n.getStorageID(), invalidateSet);
     }
     invalidateSet.add(b);
@@ -1610,6 +1975,13 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                     Server.getRemoteIp(),
                     "rename", src, dst, stat);
     }
+    
+    if(status){
+      if(bft & !bftReplaying){
+	      ((BftFSEditLog)getEditLog()).bftLogRename(now(), src, dst);
+	    }
+    }
+    
     return status;
   }
 
@@ -1653,6 +2025,12 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
         logAuditEvent(UserGroupInformation.getCurrentUGI(),
                       Server.getRemoteIp(),
                       "delete", src, null, null);
+      }
+      
+      if(status){
+	    if(bft & !bftReplaying){
+	      ((BftFSEditLog)getEditLog()).bftLogDelete(now(),src, recursive);
+	    }
       }
       return status;
     }
@@ -1718,6 +2096,14 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                     Server.getRemoteIp(),
                     "mkdirs", src, null, stat);
     }
+
+
+    if(status){
+      if(bft & !bftReplaying){
+	((BftFSEditLog)getEditLog()).bftLogMkdirs(now(), src, permissions);
+      }
+    }
+
     return status;
   }
     
@@ -1774,6 +2160,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     
     dir.setQuota(path, nsQuota, dsQuota);
     getEditLog().logSync();
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogSetQuota(path, nsQuota, dsQuota);
+    }
+    
   }
   
   /** Persist all metadata about this file.
@@ -1821,7 +2212,44 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     }
 
     INodeFileUnderConstruction pendingFile = (INodeFileUnderConstruction) iFile;
+    
+    if(bftdatanode){
+    	if(pendingFile.getBlocks().length == 0){
+    		finalizeINodeFileUnderConstruction(src, pendingFile);
+    		return;
+    	}
+    	if(pendingFile.previousHash != null){
+    		// the last block was being appended
+    		// roll-back to the status before appending
+    		Block[] blocks = pendingFile.getBlocks();
+    		Block last = blocks[blocks.length-1];
+    		BlockInfo storedBlock = blocksMap.getStoredBlock(last);
+    		Block oldBlock = new Block(storedBlock.getBlockId(),
+    				storedBlock.getNumBytes(), storedBlock.getGenerationStamp());
+    		long newGenStamp = getGenerationStamp();
+    		last.setGenerationStamp(newGenStamp);
+    		last.setHash(pendingFile.previousHash);
+    		storedBlock.setGenerationStamp(newGenStamp);
+    		storedBlock.setHash(pendingFile.previousHash);
 
+    		Iterator<DatanodeDescriptor> it = blocksMap.nodeIterator(last);
+    		for (int i = 0; it != null && it.hasNext(); i++) {
+    			DatanodeDescriptor target = it.next();
+    			target.addBlockToBeRolledBack(oldBlock, storedBlock);
+    		}
+    		finalizeINodeFileUnderConstruction(src, pendingFile);
+    	} else {
+    		// the last block was just created
+    		// Just discard the last block and remove the lease
+    		Block[] blocks = pendingFile.getBlocks();
+    		Block lastblock = blocks[blocks.length-1];
+    		blocksMap.removeINode(lastblock);
+    		pendingFile.removeBlock(lastblock);
+    		finalizeINodeFileUnderConstruction(src, pendingFile);
+    	}
+    	return;    	
+    }
+    
     // Initialize lease recovery for pendingFile. If there are no blocks 
     // associated with this file, then reap lease immediately. Otherwise 
     // renew the lease and trigger lease recovery.
@@ -1883,6 +2311,12 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           + ") since the file (=" + iFile.getLocalName()
           + ") is not under construction");
     }
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogCommitBlockSynchronization(lastblock, newgenerationstamp, newlength, closeFile, deleteblock, newtargets);
+    }
+    
+    
     INodeFileUnderConstruction pendingFile = (INodeFileUnderConstruction)iFile;
 
     // Remove old block from blocks map. This always have to be done
@@ -1937,6 +2371,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     if (isInSafeMode())
       throw new SafeModeException("Cannot renew lease for " + holder, safeMode);
     leaseManager.renewLease(holder);
+
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogRenewLease(now(), holder);
+    }
+
   }
 
   /**
@@ -1991,7 +2430,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   public synchronized void registerDatanode(DatanodeRegistration nodeReg
                                             ) throws IOException {
     String dnAddress = Server.getRemoteAddress();
-    if (dnAddress == null) {
+    if (dnAddress == null || bft) {
       // Mostly called inside an RPC.
       // But if not, use address passed by the data-node.
       dnAddress = nodeReg.getHost();
@@ -2001,6 +2440,8 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     if (!verifyNodeRegistration(nodeReg, dnAddress)) {
       throw new DisallowedDatanodeException(nodeReg);
     }
+    
+
 
     String hostName = nodeReg.getHost();
       
@@ -2010,7 +2451,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
                                       nodeReg.getInfoPort(),
                                       nodeReg.getIpcPort());
     nodeReg.updateRegInfo(dnReg);
-      
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogRegister(nodeReg);
+    }
+    
     NameNode.stateChangeLog.info(
                                  "BLOCK* NameSystem.registerDatanode: "
                                  + "node registration from " + nodeReg.getName()
@@ -2149,6 +2594,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   private String newStorageID() {
     String newID = null;
     while(newID == null) {
+    	//r = BFTRandom.getRandom();
       newID = "DS" + Integer.toString(r.nextInt());
       if (datanodeMap.get(newID) != null)
         newID = null;
@@ -2203,9 +2649,20 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
         nodeinfo.updateHeartbeat(capacity, dfsUsed, remaining, xceiverCount);
         updateStats(nodeinfo, true);
         
+        if(bft & !bftReplaying){
+          ((BftFSEditLog)getEditLog()).bftLogSendHeartbeat(now(), nodeReg, 
+              capacity, dfsUsed, remaining, xmitsInProgress, xceiverCount);
+        }
+        
         //check lease recovery
         if (cmd == null) {
           cmd = nodeinfo.getLeaseRecoveryCommand(Integer.MAX_VALUE);
+        }
+        if(bftdatanode){
+        	//check block to be rolled back
+        	if (cmd == null) {
+        		cmd = nodeinfo.getRollbackBlocks();
+        	}
         }
         //check pending replication
         if (cmd == null) {
@@ -2223,7 +2680,18 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     if (cmd == null) {
       cmd = getDistributedUpgradeCommand();
     }
+    
     return cmd;
+  }
+  
+  public boolean confirmBlockUpdate(String clientMachine, Block blk){
+  	INodeFile openedFile = blocksMap.getINode(blk);
+  	if(!openedFile.isUnderConstruction()){
+  		LOG.debug("Block : " + blk +" is not for opened File");
+  		return false;
+  	}
+  	LOG.debug("confirm block " + blk + " for append");
+  	return true;
   }
 
   private void updateStats(DatanodeDescriptor node, boolean isAdded) {
@@ -2283,6 +2751,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           LOG.warn("ReplicationMonitor thread received exception. " + ie);
         } catch (Throwable t) {
           LOG.warn("ReplicationMonitor thread received Runtime exception. " + t);
+          t.printStackTrace(System.out);
           Runtime.getRuntime().exit(-1);
         }
       }
@@ -2428,6 +2897,10 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
 
         for (DatanodeDescriptor dn : targets) {
           dn.incBlocksScheduled();
+          dn.setXceiverCount(dn.getXceiverCount()+2);
+          synchronized (heartbeats) {
+            this.totalLoad +=2;
+          } 
         }
         
         // Move the block-replication into a "pending" state.
@@ -2517,6 +2990,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       // switch to a different node randomly
       // this to prevent from deterministically selecting the same node even
       // if the node failed to replicate the block on previous iterations
+      //r = BFTRandom.getRandom();
       if(r.nextBoolean())
         srcNode = node;
     }
@@ -2611,6 +3085,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     DatanodeDescriptor nodeInfo = getDatanode(nodeID);
     if (nodeInfo != null) {
       removeDatanode(nodeInfo);
+
+      if(bft & !bftReplaying){
+	((BftFSEditLog)getEditLog()).bftLogRemoveDatanode(nodeID);
+      }
+      
     } else {
       NameNode.stateChangeLog.warn("BLOCK* NameSystem.removeDatanode: "
                                    + nodeID.getName() + " does not exist");
@@ -2754,7 +3233,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       setDatanodeDead(node);
       throw new DisallowedDatanodeException(node);
     }
-    
+
     //
     // Modify the (block-->datanode) map, according to the difference
     // between the old and new block report.
@@ -2776,7 +3255,63 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           + " does not belong to any file.");
       addToInvalidates(b, node);
     }
-    NameNode.getNameNodeMetrics().blockReport.inc((int) (now() - startTime));
+    
+    if(NameNode.getNameNodeMetrics() != null){
+      NameNode.getNameNodeMetrics().blockReport.inc((int) (now() - startTime));
+    }
+  }
+  
+  /**
+   * processReport() for supprting BFT datanode. 
+   * Use Block[] instead of BlockListAsLongs to deliver hash of each block
+   */
+  public synchronized void processReport(DatanodeID nodeID, 
+                                         Block[] newReport
+                                        ) throws IOException {
+    long startTime = now();
+    if (NameNode.stateChangeLog.isDebugEnabled()) {
+      NameNode.stateChangeLog.debug("BLOCK* [BFTDN] NameSystem.processReport: "
+                             + "from " + nodeID.getName()+" " + 
+                             newReport.length+" blocks");
+    }
+    DatanodeDescriptor node = getDatanode(nodeID);
+    if (node == null) {
+      throw new IOException("ProcessReport from unregisterted node: "
+                            + nodeID.getName());
+    }
+
+    // Check if this datanode should actually be shutdown instead.
+    if (shouldNodeShutdown(node)) {
+      setDatanodeDead(node);
+      throw new DisallowedDatanodeException(node);
+    }
+
+    //
+    // Modify the (block-->datanode) map, according to the difference
+    // between the old and new block report.
+    //
+    Collection<Block> toAdd = new LinkedList<Block>();
+    Collection<Block> toRemove = new LinkedList<Block>();
+    Collection<Block> toInvalidate = new LinkedList<Block>();
+    
+    node.reportDiff(blocksMap, newReport, toAdd, toRemove, toInvalidate);
+        
+    for (Block b : toRemove) {
+      removeStoredBlock(b, node);
+    }
+    for (Block b : toAdd) {
+      addStoredBlock(b, node, null);
+    }
+    for (Block b : toInvalidate) {
+      NameNode.stateChangeLog.info("BLOCK* NameSystem.processReport: block " 
+          + b + " on " + node.getName() + " size " + b.getNumBytes()
+          + " does not belong to any file.");
+      addToInvalidates(b, node);
+    }
+    
+    if(NameNode.getNameNodeMetrics() != null){
+      NameNode.getNameNodeMetrics().blockReport.inc((int) (now() - startTime));
+    }
   }
 
   /**
@@ -3252,6 +3787,142 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       }
     }
 
+    if(bftdatanode){
+    	if(block.getHash() == null){
+    		LOG.debug("[bft] blockReceived Hash Val : NULL");
+    	} else {
+    		LOG.debug("[bft] blockReceived Hash Val : " + new MD5Hash(block.getHash()).toString());
+    	}
+    	//
+    	// Check hash of the block
+    	//
+
+    	BlockInfo bi = blocksMap.getStoredBlock(block);
+    	if(bi==null){
+    		// the block has been deleted already
+    		invalidateBlock(block, node);
+    		return;
+    	}
+    	byte[] hash = bi.getHash();
+    	if( hash != null ){
+    		// NN already knows that there are enough DNs who agreed on this hash
+    		// for the block.  Hence if this hash matches, just accept this block
+    		if( Arrays.equals(block.getHash(), hash)){
+    			addStoredBlock(block, node, delHintNode );
+    			pendingReplications.remove(block);
+    		} else {
+    			invalidateBlock(block, node);
+    		}
+    		return;
+    	}
+
+    	byte[] hashFromClient = blocksMap.getStoredBlock(block).getAddedHash();
+    	byte[] hashFromDN = ((block.getAddedHash()==null)?block.getHash():block.getAddedHash());
+    	if ( hashFromClient == null ){
+    		// Client has not informed us of hash value of this block
+    		// Buffer the block until we get to know it
+    		LinkedList<Object[]> tripletList;
+    		synchronized(undecidedBlocks){
+    			if(undecidedBlocks.containsKey(block)){
+    				tripletList = undecidedBlocks.get(block);    		
+    			} else {
+    				tripletList = new LinkedList<Object[]>();
+    			}
+    			Object[] triplet = new Object[3];
+    			triplet[0] = block;
+    			triplet[1] = node;
+    			triplet[2] = delHintNode;
+
+    			tripletList.add(triplet);
+    			undecidedBlocks.put(block, tripletList);
+    		}
+    		return;
+    	} else if	(!Arrays.equals(hashFromClient, hashFromDN) ){
+    		// We got a corrupted block
+    		// Add this to invalidate set
+    		try{
+    			invalidateBlock(block, node);
+    			return;
+    		}catch (IOException e) {
+    			LOG.warn("Error in deleting bad block " + block + e);
+    			return;
+    		}
+    	} else if (blocksMap.numNodes(block) <= 0){
+    		// Hashes match to each other
+    		LinkedList<Object[]> tripletList;
+
+    		synchronized(undecidedBlocks){
+    			if(undecidedBlocks.containsKey(block)){
+    				tripletList = undecidedBlocks.get(block);    		
+    			} else {
+    				tripletList = new LinkedList<Object[]>();
+    			}
+
+    			Object[] triplet_ = new Object[3];
+    			triplet_[0] = block;
+    			triplet_[1] = node;
+    			triplet_[2] = delHintNode;
+
+    			tripletList.add(triplet_);
+    			// if we haven't received enough number of reports from DNs, wait
+    			if(tripletList.size() < this.minReplication){
+    				undecidedBlocks.put(block, tripletList);
+    				return;
+    			} else {
+    				// we have enough number for checking quorum
+    				HashMap<MD5Hash,Integer> quorumCheck =
+    					new HashMap<MD5Hash,Integer>();
+    				for(Object[] triplet : tripletList){
+    					Block b = (Block)triplet[0];
+    					MD5Hash key = new MD5Hash(b.getHash());
+    					if(quorumCheck.containsKey(key)){
+    						int prev = quorumCheck.get(key);
+    						quorumCheck.put(key, prev+1);
+    					} else {
+    						quorumCheck.put(key, 1);
+    					}
+    				}
+
+    				int max = 0;
+    				MD5Hash maxHash = null;
+    				for(MD5Hash hash_ : quorumCheck.keySet()){
+    					int numReply = quorumCheck.get(hash_);
+    					if(numReply >= max){
+    						max = numReply;
+    						maxHash = hash_;
+    					}
+    				}
+
+    				if(max < this.minReplication){
+    					// Not enough number of matching hashes collected
+    					LOG.debug("current size: " + max + " (needed "+this.minReplication+")");
+    					undecidedBlocks.put(block, tripletList);
+    				} else {
+    					LOG.debug("quorum is established for block: " + block);
+    					for(Object[] triplet : tripletList){
+    						Block b = (Block)triplet[0];
+    						if(Arrays.equals(b.getHash(),maxHash.getDigest())){
+    							addStoredBlock(b,
+    									(DatanodeDescriptor)triplet[1],
+    									(DatanodeDescriptor)triplet[2]);
+    						}
+    					}
+    					undecidedBlocks.remove(block);
+    					blocksMap.getStoredBlock(block).setHash(maxHash.getDigest());
+    					blocksMap.getStoredBlock(block).setAddedHash(null);
+    					pendingReplications.remove(block);
+    					return;
+    				}      			
+
+    			}		    			
+    		} // end of synchronized(undecidedBlocks)		
+    	} else {
+    		LOG.error("Must not reach here");
+    		System.exit(-1);
+    	}
+    	return;
+    }
+    
     //
     // Modify the blocks->datanode map and node's map.
     // 
@@ -3262,6 +3933,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
   long[] getStats() throws IOException {
     checkSuperuserPrivilege();
     synchronized(heartbeats) {
+
       return new long[]
             {getCapacityTotal(), getCapacityUsed(), getCapacityRemaining()};
     }
@@ -3659,7 +4331,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           }
         }
       }
-    } 
+    }
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogRefreshNodes();
+    }
       
   }
     
@@ -3776,6 +4452,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
     int size = datanodeMap.size();
     int index = 0;
     if (size != 0) {
+    	//r = BFTRandom.getRandom();
       index = r.nextInt(size);
       for(int i=0; i<size; i++) {
         DatanodeDescriptor d = getDatanodeByIndex(index);
@@ -3819,7 +4496,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
    * @see ClientProtocol#setSafeMode(FSConstants.SafeModeAction)
    * @see SafeModeMonitor
    */
-  class SafeModeInfo {
+  class SafeModeInfo implements Writable {
     // configuration fields
     /** Safe mode threshold condition %.*/
     private double threshold;
@@ -3887,6 +4564,7 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       } catch(IOException e) {
         System.err.print(StringUtils.stringifyException(e));
       }
+      this.reportStatus("BFT::", true);
       return this.reached >= 0;
     }
       
@@ -3925,7 +4603,10 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       long timeInSafemode = now() - systemStart;
       NameNode.stateChangeLog.info("STATE* Leaving safe mode after " 
                                     + timeInSafemode/1000 + " secs.");
-      NameNode.getNameNodeMetrics().safeModeTime.set((int) timeInSafemode);
+      
+      if(NameNode.getNameNodeMetrics()!=null){
+	NameNode.getNameNodeMetrics().safeModeTime.set((int) timeInSafemode);
+      }
       
       if (reached >= 0) {
         NameNode.stateChangeLog.info("STATE* Safe mode is OFF."); 
@@ -4099,6 +4780,30 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       return (blockTotal == activeBlocks) ||
         (blockSafe >= 0 && blockSafe <= blockTotal);
     }
+
+    @Override
+    public void readFields(DataInput in) throws IOException {
+      threshold = in.readDouble();
+      extension = in.readInt();
+      safeReplication = in.readInt();
+      reached = in.readLong();
+      blockTotal = in.readInt();
+      blockSafe = in.readInt();
+      lastStatusReport = in.readLong();
+      
+    }
+
+    @Override
+    public void write(DataOutput out) throws IOException {
+      out.writeDouble(threshold);
+      out.writeInt(extension);
+      out.writeInt(safeReplication);
+      out.writeLong(reached);
+      out.writeInt(blockTotal);
+      out.writeInt(blockSafe);
+      out.writeLong(lastStatusReport);
+
+    }
   }
     
   /**
@@ -4131,6 +4836,8 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
    * @return current time in msec.
    */
   static long now() {
+  	if(bft)
+  		return BFTRandom.now();
     return System.currentTimeMillis();
   }
     
@@ -4146,6 +4853,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
         break;
       }
     }
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogSetSafeMode(action);
+    }
+    
     return isInSafeMode();
   }
 
@@ -4503,6 +5215,11 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
       LOG.info(msg);
       throw new IOException(msg);
     }
+    
+    if(bft & !bftReplaying){
+      ((BftFSEditLog)getEditLog()).bftLogNextGenerationStamp(now(), block);
+    }
+    
     return nextGenerationStamp();
   }
 
@@ -4555,8 +5272,383 @@ public class FSNamesystem implements FSConstants, FSNamesystemMBean {
           }
           INodeFileUnderConstruction cons = (INodeFileUnderConstruction) node;
           FSImage.writeINodeUnderConstruction(out, cons, path);
+          if(bft){
+          	// Saving datanode infos 
+          	DatanodeDescriptor dd = cons.clientNode;
+          	if(dd != null){
+          		out.writeBoolean(true);
+          		if(datanodeMap.containsKey((dd.storageID))){
+          			out.writeBoolean(true);
+          			out.writeUTF(dd.storageID);
+          		} else {
+          			out.writeBoolean(false);
+          			dd.write1(out);
+          			dd.write2(out);
+          		}
+          	} else {
+          		out.writeBoolean(false);
+          	}
+          	// save targets
+          	DatanodeDescriptor targets[] = cons.getTargets();
+          	if(targets == null) {targets=new DatanodeDescriptor[0];}
+          	out.writeInt(targets.length);
+          	//System.out.println("Target Len : " + targets.length);
+          	for(DatanodeDescriptor target : targets){
+          		String sid = target.storageID;
+            	if(datanodeMap.containsKey(sid)){
+            		out.writeBoolean(true);
+            		out.writeUTF(sid);
+            	} else {
+            		out.writeBoolean(false);
+            		target.write1(out);
+            		target.write2(out);
+            	}
+          	}
+          	
+          	out.writeInt(cons.primaryNodeIndex);
+          	out.writeLong(cons.lastRecoveryTime);
+          	if(bftdatanode){
+          		if(cons.previousHash != null){
+          			out.writeBoolean(true);
+          			out.writeInt(cons.previousHash.length);
+          			out.write(cons.previousHash, 0, cons.previousHash.length);
+          		} else {
+          			out.writeBoolean(false);
+          		}
+          	}
+          	out.writeLong(lease.getLastUpdate());
+          } // end of bft
         }
       }
     }
   }
+  
+  ////////////////////////////////////////////////////////////////////////
+  // The following saveXXX()/readXXX() are added to save the states, which are
+  // not included by original version of hdfs namenode's checkpoint,
+  // into a checkpoint in order to support bft namenode
+
+  void saveRecentInvalidateSets(DataOutputStream out) throws IOException {
+  	out.writeInt(recentInvalidateSets.size());
+
+  	for (String sid : recentInvalidateSets.keySet()){
+  		Collection<Block> blocks = recentInvalidateSets.get(sid);
+  		Text.writeString(out, sid);
+  		out.writeInt(blocks.size());
+  		for (Block b : blocks){
+  			if(b==null){
+  				System.out.println("### b is nul!!! surprise ");
+  			}
+  			// Since we won't be able to find BlockInfo for this block when we load it from image,
+  			// we should write all info rather than just block id
+  			b.write(out);
+  		}      
+  	}
+  }
+  
+  void readRecentInvalidateSets(DataInputStream in) throws IOException {
+    recentInvalidateSets.clear();
+    
+    int size = in.readInt();
+    
+    for(int i=0; i<size; i++){
+      String sid = Text.readString(in);
+      int nBlocks = in.readInt();
+      Collection<Block> blocks  = new TreeSet<Block>();
+      for(int j=0; j<nBlocks; j++){
+      	Block b = new Block();
+      	b.readFields(in);
+      	blocks.add(b);
+      }
+      recentInvalidateSets.put(sid, blocks);
+    }
+
+  }
+  
+  void saveUndecidedBlocks(DataOutputStream out) throws IOException {  	
+  	out.writeInt(undecidedBlocks.size());  	
+  	for(Block blk : undecidedBlocks.keySet()){
+  		LinkedList<Object[]> list = undecidedBlocks.get(blk);
+  		out.writeLong(blk.getBlockId());
+  		out.writeInt(list.size());
+  		for(Object[] triplet : list){
+  			((Block)triplet[0]).write(out);
+  			Text.writeString(out, ((DatanodeDescriptor)triplet[1]).getStorageID());
+  			if(triplet[2] == null){
+  				Text.writeString(out, "");
+  			} else {
+  				Text.writeString(out, ((DatanodeDescriptor)triplet[2]).getStorageID());
+  			}
+  		}  		
+  	}  	
+  }
+  
+  void readUndecidedBlocks(DataInputStream in) throws IOException {
+  	undecidedBlocks.clear();
+  	int size = in.readInt();
+  	for(int i=0; i < size; i++){
+  		long blockId = in.readLong();
+  		Block blk = new Block(blockId);
+  		LinkedList<Object[]> list = new LinkedList<Object[]>();
+  		int listSize = in.readInt();
+  		for(int j=0; j < listSize; j++){
+  			Object[] triplet = new Object[3];  			
+  			Block b = new Block();
+  			b.readFields(in);
+  			triplet[0] = b;  			
+  			String sid = Text.readString(in);
+  			triplet[1] = datanodeMap.get(sid);
+  			sid = Text.readString(in);
+  			if(sid == ""){
+  				triplet[2] = null;
+  			} else {
+  				triplet[2] = datanodeMap.get(sid);
+  			}
+  			list.add(triplet);
+  		}
+  		undecidedBlocks.put(blocksMap.getStoredBlock(blk), list);
+  	}
+  }
+
+  void saveExcessReplicateMap(DataOutputStream out) throws IOException {
+    
+    out.writeInt(excessReplicateMap.size());
+    
+    for (String sid : excessReplicateMap.keySet()){
+      Collection<Block> blocks = excessReplicateMap.get(sid);
+      Text.writeString(out, sid);
+      out.writeInt(blocks.size());
+      for (Block b : blocks){
+        out.writeLong(b.getBlockId());
+      }      
+    }
+
+  }
+  
+  void readExcessReplicateMap(DataInputStream in) throws IOException {
+    
+    excessReplicateMap.clear();
+    
+    int size = in.readInt();
+    
+    for(int i=0; i<size; i++){
+      String sid = Text.readString(in);
+      int nBlocks = in.readInt();
+      Collection<Block> blocks  = new TreeSet<Block>();
+      for(int j=0; j<nBlocks; j++){
+      	Block b = new Block(in.readLong());
+      	blocks.add(blocksMap.getStoredBlock(b));
+      }
+      excessReplicateMap.put(sid, blocks);
+    }
+    
+  }
+
+  void saveHeartbeats(DataOutputStream out) throws IOException {
+    out.writeInt(heartbeats.size());
+    Iterator<DatanodeDescriptor> iter = heartbeats.iterator();
+    while(iter.hasNext()){
+    	DatanodeDescriptor dd = iter.next();
+      Text.writeString(out, dd.getStorageID());
+    }
+    
+  }
+  
+  void readHeartbeats(DataInputStream in) throws IOException {
+    heartbeats.clear();
+    
+    int size = in.readInt();
+    for(int i=0; i < size; i++){
+      String sid = Text.readString(in);
+      heartbeats.add(datanodeMap.get(sid));
+    }
+  }
+
+  void saveNeededAndPendingReplication(DataOutputStream out) throws IOException {
+
+    out.writeLong(capacityTotal);
+    out.writeLong(capacityUsed);
+    out.writeLong(capacityRemaining);
+    out.writeInt(totalLoad);
+    out.writeLong(pendingReplicationBlocksCount);
+    out.writeLong(underReplicatedBlocksCount);
+    out.writeLong(scheduledReplicationBlocksCount);
+    out.writeLong(lastHeartBeatCheck);
+    out.writeLong(lastReplicationCheck);
+    out.writeLong(lastDecommissionCheck);
+    out.writeLong(lastLeaseCheck);
+    out.writeLong(lastPendingReplicationBlockCheck);
+
+    neededReplications.write(out); 
+    if(pendingReplications == null){
+      out.writeBoolean(false);
+    }else{
+      out.writeBoolean(true);
+      pendingReplications.write(out);
+    }
+    host2DataNodeMap.write(out);
+    clusterMap.write(out);
+    
+    if(safeMode != null){
+    	System.out.println("saving safe mode info");
+      out.writeBoolean(true);
+      safeMode.write(out);
+    }else{
+      out.writeBoolean(false);
+    }
+  }
+  
+  void readNeededAndPendingReplication(DataInputStream in) throws IOException {
+    
+    capacityTotal = in.readLong();
+    capacityUsed = in.readLong();
+    capacityRemaining = in.readLong();
+    totalLoad = in.readInt();
+    pendingReplicationBlocksCount = in.readLong();
+    underReplicatedBlocksCount = in.readLong();
+    scheduledReplicationBlocksCount = in.readLong();
+    
+    lastHeartBeatCheck = in.readLong();
+    lastReplicationCheck = in.readLong();
+    lastDecommissionCheck = in.readLong();
+    lastLeaseCheck = in.readLong();
+    lastPendingReplicationBlockCheck = in.readLong();
+
+    neededReplications.readFields(in);
+    if(in.readBoolean()){
+    	if(pendingReplications != null){
+    		pendingReplications.readFields(in);
+    	}else{
+    		new Throwable().printStackTrace();
+    	}
+    }
+    host2DataNodeMap.readFields(in);
+    clusterMap.readFields(in);
+
+    if(in.readBoolean()){
+    	safeMode = new SafeModeInfo();
+    	safeMode.readFields(in);
+    	safeMode.checkMode();
+    }
+  }
+
+  ///////////////////////////////////////////////////////////////////////
+  // The following code is to eliminate nondeterminism caused by threads.
+  // For bft namenode, we disables all background threads and executes
+  // the functionality of the threads periodically in a deterministic manner
+  // by using bft time
+  
+  protected long lastHeartBeatCheck = 0;
+  protected long lastReplicationCheck = 0;
+  protected long lastDecommissionCheck = 0;
+  protected long lastLeaseCheck = 0;
+  protected long lastPendingReplicationBlockCheck = 0;
+  void printLastCheckTime(){
+  	String msg = "hb : " + lastHeartBeatCheck +
+  								", replication : " + lastReplicationCheck +
+  								", decommision : " + lastDecommissionCheck +
+  								", lease : " + lastLeaseCheck + 
+  								", pendingreplication : " + lastPendingReplicationBlockCheck + "\n";
+  	
+  	System.out.println(msg);
+  }
+  void executeThreadFunctions(){
+  	
+  	assert bft;
+    
+    // Heartbeat Monitor
+  	
+  	if( now() - lastHeartBeatCheck > heartbeatRecheckInterval){
+  		try {
+      	heartbeatCheck();
+    	} catch (Exception e) {
+      	FSNamesystem.LOG.error(StringUtils.stringifyException(e));
+    	}
+    	lastHeartBeatCheck = now();
+      if(bft & !bftReplaying){
+        ((BftFSEditLog)getEditLog()).bftLogHeartBeatMonitor(now());
+      }
+  	}
+    
+    //Replication Monitor
+  	if( now() - lastReplicationCheck > replicationRecheckInterval){
+  		try {
+  			computeDatanodeWork();
+  		} catch (IOException ie) {
+  			LOG.warn("ReplicationMonitor thread received exception. " + ie);
+  		}
+  		processPendingReplications();		
+  		lastReplicationCheck = now();
+      if(bft & !bftReplaying){
+        ((BftFSEditLog)getEditLog()).bftLogReplicationMonitor(now());
+      }
+  	}
+    
+    
+    // Safemode Monitor
+    if (safeMode != null && !safeMode.canLeave()) {
+    	if(safeMode != null)
+    		safeMode.leave(true, true);
+    }
+
+    // DecommisionMonitor
+    //if(true){
+    if( now() - lastDecommissionCheck > decommissionRecheckInterval){
+    	try {
+    		decommissionedDatanodeCheck();
+    	} catch (Exception e) {
+    		FSNamesystem.LOG.info(StringUtils.stringifyException(e));
+    	}	
+    	lastDecommissionCheck = now();
+      if(bft & !bftReplaying){
+        ((BftFSEditLog)getEditLog()).bftLogDecommisionMonitor(now());
+      }
+    }
+    
+    // Lease Monitor
+    if( now() - lastLeaseCheck > 2000 ){
+    	checkLease();	
+    	lastLeaseCheck = now();
+      if(bft & !bftReplaying){
+        ((BftFSEditLog)getEditLog()).bftLogLeaseMonitor(now());
+      }
+    }
+    
+    // pending replication monitor
+    if( now() - lastPendingReplicationBlockCheck > 5 * 60 * 1000){    	
+    	pendingReplications.pendingReplicationMonitor.pendingReplicationCheck();
+    	lastPendingReplicationBlockCheck = now();
+      if(bft & !bftReplaying){
+        ((BftFSEditLog)getEditLog()).bftLogPendingReplicationMonitor(now());
+      }
+    }
+
+  }
+  
+  public void checkLease(){
+  	assert bft;
+    synchronized (this) {
+      //synchronized (lmthread) {
+        Lease top;
+        SortedSet<Lease> sortedLeases = leaseManager.getSortedLeases();
+        while ((sortedLeases.size() > 0) &&
+               ((top = sortedLeases.first()) != null)) {
+          if (top.expiredHardLimit()) {
+            LOG.info("Lease Monitor: Removing lease " + top
+                + ", sortedLeases.size()=: " + sortedLeases.size());
+            for(StringBytesWritable s : top.getPaths()) {
+              try {
+								internalReleaseLease(top, s.getString());
+							} catch (IOException e) {
+								LOG.error("In " + getClass().getName(), e);
+							}
+            }
+          } else {
+            break;
+          }
+        }
+      //}
+    }
+  }
+ 
 }

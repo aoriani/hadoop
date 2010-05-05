@@ -124,7 +124,6 @@ class ReplicationTargetChooser {
                                                 excludedNodes, blocksize, maxNodesPerRack, results);
       
     results.removeAll(choosenNodes);
-
       
     // sorting nodes to form a pipeline
     return getPipeline((writer==null)?localNode:writer,
@@ -184,6 +183,7 @@ class ReplicationTargetChooser {
     } catch (NotEnoughReplicasException e) {
       FSNamesystem.LOG.warn("Not able to place enough replicas, still in need of "
                + numOfReplicas);
+      System.err.println("### : " + FSNamesystem.now()); e.printStackTrace();
     }
     return writer;
   }
@@ -201,14 +201,14 @@ class ReplicationTargetChooser {
                                              List<DatanodeDescriptor> results)
     throws NotEnoughReplicasException {
     // if no local machine, randomly choose one node
-    if (localMachine == null){
-    	//System.out.println("** NO LOCAL MACHINE : CHOOSE RANDOM");
+  	System.err.println("excludedNodes size 2 : " + excludedNodes.size());
+    if (localMachine == null)
       return chooseRandom(NodeBase.ROOT, excludedNodes, 
                           blocksize, maxNodesPerRack, results);
-    }
       
     // otherwise try local machine first
     if (!excludedNodes.contains(localMachine)) {
+    	System.err.println("Adding excludedNodes");(new Throwable()).printStackTrace();
       excludedNodes.add(localMachine);
       if (isGoodTarget(localMachine, blocksize,
                        maxNodesPerRack, false, results)) {
@@ -313,8 +313,10 @@ class ReplicationTargetChooser {
     throws NotEnoughReplicasException {
     DatanodeDescriptor result;
     do {
+    	System.err.println("excludedNodes size 3 : " + excludedNodes.size());
       DatanodeDescriptor[] selectedNodes = 
         chooseRandom(1, nodes, excludedNodes);
+      System.err.println("excludedNodes size 3-1 : " + excludedNodes.size());
       if (selectedNodes.length == 0) {
         throw new NotEnoughReplicasException(
                                              "Not able to place enough replicas");
@@ -364,19 +366,31 @@ class ReplicationTargetChooser {
                                             List<Node> excludedNodes) {
     List<DatanodeDescriptor> results = 
       new ArrayList<DatanodeDescriptor>();
+    System.err.println("excludedNodes size 4 : " + excludedNodes.size());
     int numOfAvailableNodes =
       clusterMap.countNumOfAvailableNodes(nodes, excludedNodes);
+    System.err.println("numOfAvailableNodes: " + numOfAvailableNodes);
+    System.err.println("excludedNodes size 5 : " + excludedNodes.size());
+    if(excludedNodes.size() > 0){
+    	(new Throwable()).printStackTrace();
+    }
     numOfReplicas = (numOfAvailableNodes<numOfReplicas)?
       numOfAvailableNodes:numOfReplicas;
+    System.err.println("numOfReplicas: " + numOfReplicas);
     while(numOfReplicas > 0) {
       DatanodeDescriptor choosenNode = 
         (DatanodeDescriptor)(clusterMap.chooseRandom(nodes));
+      if(choosenNode == null){
+      	System.err.println("choosen node is null");
+      }
       if (!excludedNodes.contains(choosenNode)) {
+      	System.err.println("Adding result : " + choosenNode);
         results.add(choosenNode);
         excludedNodes.add(choosenNode);
         numOfReplicas--;
       }
     }
+    System.err.println("results size: " + results.size());
     return (DatanodeDescriptor[])results.toArray(
                                                  new DatanodeDescriptor[results.size()]);    
   }
@@ -399,6 +413,8 @@ class ReplicationTargetChooser {
     Log logr = FSNamesystem.LOG;
     // check if the node is (being) decommissed
     if (node.isDecommissionInProgress() || node.isDecommissioned()) {
+    	System.err.println("Node "+NodeBase.getPath(node)+
+      " is not chosen because the node is (being) decommissioned");
       logr.debug("Node "+NodeBase.getPath(node)+
                 " is not chosen because the node is (being) decommissioned");
       return false;
@@ -408,9 +424,18 @@ class ReplicationTargetChooser {
                      (node.getBlocksScheduled() * blockSize); 
     // check the remaining capacity of the target machine
     if (blockSize* FSConstants.MIN_BLOCKS_FOR_WRITE>remaining) {
+    	String str = "node.getRemaining() : " + node.getRemaining() +"\n"
+    						+ "node.getBlocksScheduled() : "+node.getBlocksScheduled()+"\n"
+    						+ "blockSize : " + blockSize +"\n"
+    						+ "remaining : " + remaining +"\n"
+    						+ "blockSize* FSConstants.MIN_BLOCKS_FOR_WRITE : "
+    						+ (blockSize* FSConstants.MIN_BLOCKS_FOR_WRITE) ;
+    	System.err.println(str);
+    	System.err.println(node.getDatanodeReport());
+    	System.err.println("Node "+NodeBase.getPath(node)+
+      " is not chosen because the node does not have enough space");
       logr.debug("Node "+NodeBase.getPath(node)+
                 " is not chosen because the node does not have enough space");
-      //System.out.println(node.dumpDatanode());
       return false;
     }
       
@@ -421,8 +446,9 @@ class ReplicationTargetChooser {
       if (size != 0) {
         avgLoad = (double)fs.getTotalLoad()/size;
       }
-      
       if (node.getXceiverCount() > (2.0 * avgLoad)) {
+      	System.err.println("Node "+NodeBase.getPath(node)+
+        " is not chosen because the node is too busy");
         logr.debug("Node "+NodeBase.getPath(node)+
                   " is not chosen because the node is too busy");
         return false;
@@ -440,6 +466,8 @@ class ReplicationTargetChooser {
       }
     }
     if (counter>maxTargetPerLoc) {
+    	System.err.println("Node "+NodeBase.getPath(node)+
+      " is not chosen because the rack has too many chosen nodes");
       logr.debug("Node "+NodeBase.getPath(node)+
                 " is not chosen because the rack has too many chosen nodes");
       return false;

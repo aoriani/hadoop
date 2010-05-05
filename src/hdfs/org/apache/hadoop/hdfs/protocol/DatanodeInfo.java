@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.Date;
 
 import org.apache.hadoop.fs.FsShell;
+import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableFactories;
@@ -113,7 +114,7 @@ public class DatanodeInfo extends DatanodeID implements Node {
   public long getLastUpdate() { return lastUpdate; }
 
   /** number of active connections */
-  public int getXceiverCount() { return xceiverCount; }
+  synchronized public int getXceiverCount() { return xceiverCount; }
 
   /** Sets raw capacity. */
   public void setCapacity(long capacity) { 
@@ -131,7 +132,8 @@ public class DatanodeInfo extends DatanodeID implements Node {
   }
 
   /** Sets number of active connections */
-  public void setXceiverCount(int xceiverCount) { 
+  synchronized public void setXceiverCount(int xceiverCount) { 
+  	FSNamesystem.LOG.debug("Setting xceiver count for " + this.name + " to " + xceiverCount);  	
     this.xceiverCount = xceiverCount; 
   }
 

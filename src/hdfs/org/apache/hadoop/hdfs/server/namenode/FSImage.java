@@ -32,11 +32,14 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Properties;
 import java.util.Random;
 import java.util.Map;
 import java.util.HashMap;
+import java.util.SortedSet;
+import java.util.TreeSet;
 import java.lang.Math;
 import java.nio.ByteBuffer;
 
@@ -44,11 +47,13 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.PermissionStatus;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.BFTRandom;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.NodeType;
 import org.apache.hadoop.hdfs.server.common.HdfsConstants.StartupOption;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.UTF8;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
@@ -66,6 +71,8 @@ import org.apache.hadoop.hdfs.server.common.UpgradeManager;
  */
 public class FSImage extends Storage {
 
+	public static final boolean useDummyEditLog = true;
+	
   private static final SimpleDateFormat DATE_FORM =
     new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
 
@@ -129,11 +136,23 @@ public class FSImage extends Storage {
   static private final FsPermission FILE_PERM = new FsPermission((short)0);
   static private final byte[] PATH_SEPARATOR = INode.string2Bytes(Path.SEPARATOR);
 
+  static public boolean bft = false;
+
   /**
    */
-  FSImage() {
+  protected FSImage() {
     super(NodeType.NAME_NODE);
-    this.editLog = new FSEditLog(this);
+
+    bft = FSNamesystem.bft;
+    if(bft){
+    	if(useDummyEditLog)
+    		this.editLog = new BftDummyFSEditLog(this);
+    	else
+    		this.editLog = new BftFSEditLog(this);
+    }else{
+      this.editLog = new FSEditLog(this);
+    }
+    
   }
 
   /**
@@ -795,7 +814,7 @@ public class FSImage extends Storage {
    * "re-save" and consolidate the edit-logs
    */
   boolean loadFSImage(File curFile) throws IOException {
-    assert this.getLayoutVersion() < 0 : "Negative layout version is expected.";
+    //assert this.getLayoutVersion() < 0 : "Negative layout version is expected.";
     assert curFile != null : "curFile is null";
 
     FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
@@ -848,14 +867,17 @@ public class FSImage extends Storage {
       String path;
       String parentPath = "";
       INodeDirectory parentINode = fsDir.rootDir;
+      //System.out.println("root dir : " + System.identityHashCode(fsDir.rootDir));
       for (long i = 0; i < numFiles; i++) {
         long modificationTime = 0;
         long atime = 0;
         long blockSize = 0;
         path = readString(in);
+        //System.out.println("*** Loading file : " + path);
         replication = in.readShort();
         replication = FSEditLog.adjustReplication(replication);
         modificationTime = in.readLong();
+        //System.out.println("mod time : " + modificationTime);
         if (imgVersion <= -17) {
           atime = in.readLong();
         }
@@ -878,6 +900,7 @@ public class FSImage extends Storage {
             } else {
               blocks[j].readFields(in);
             }
+            //System.out.println("*** block id : " + blocks[j].getBlockId());
           }
         }
         // Older versions of HDFS does not store the block size in inode.
@@ -924,20 +947,85 @@ public class FSImage extends Storage {
         // add new inode
         parentINode = fsDir.addToParent(path, parentINode, permissions,
                                         blocks, replication, modificationTime, 
-                                        atime, nsQuota, dsQuota, blockSize);
+                                        atime, nsQuota, dsQuota, blockSize,
+                                        // do not update mod time of parent
+                                        false);
       }
-      
+      //System.out.println("Num of All files in rootdir : " + 
+      //		fsDir.rootDir.numItemsInTree());
       // load datanode info
       this.loadDatanodes(imgVersion, in);
 
+
+      
+      readDelimiter(in);
+      //
+      // BFT
+      //
+      if(bft){
+      	//System.out.println("FILENAME : " + curFile.getAbsolutePath());
+
+      	int bft_magicNum = in.readInt();
+      	//System.out.println("BFT : " + bft_magicNum);
+      	if(bft_magicNum == 107){
+      		//System.out.println("~~~~~~~" + Text.readString(in));
+
+      		loadOrphanBlockInfos(in);
+
+      		loadDatanodeDescriptors(imgVersion, in, fsNamesys);
+      		readDelimiter(in);
+      		loadOthers(in, fsNamesys);
+      	} else {
+      		LOG.info("Image file is not BFT version");
+      	}
+      }
+      // All datanodes info need to be loaded before this
       // load Files Under Construction
       this.loadFilesUnderConstruction(imgVersion, in, fsNamesys);
+
       
     } finally {
       in.close();
     }
     
     return needToSave;
+  }
+  
+  private void loadOthers(DataInputStream in, FSNamesystem fsNamesys) throws IOException {
+  	readDelimiter(in);
+    fsNamesys.corruptReplicas.readFields(in);
+    readDelimiter(in);
+    fsNamesys.readRecentInvalidateSets(in);
+    readDelimiter(in);
+    fsNamesys.readExcessReplicateMap(in);
+    readDelimiter(in);
+    fsNamesys.readHeartbeats(in);
+    readDelimiter(in);
+    fsNamesys.readNeededAndPendingReplication(in);
+    readDelimiter(in);
+    fsNamesys.readUndecidedBlocks(in);
+    
+  }
+
+  private void loadDatanodeDescriptors(int imgVersion, DataInputStream in, FSNamesystem fsNamesys) throws IOException {
+    int nDescriptors = in.readInt();
+    
+    DatanodeDescriptor[] dds = new DatanodeDescriptor[nDescriptors];
+    for(int i=0; i<nDescriptors; i++){
+      dds[i] = new DatanodeDescriptor();
+      dds[i].readFields1(in);
+      
+      // It is important to put this DatanodeDescriptor into datanodeMap
+      // since it is being used by DatanodeDescriptor.readFields2()
+      fsNamesys.datanodeMap.put(dds[i].storageID, dds[i]);
+    }
+    
+    for(int i=0; i<nDescriptors; i++){
+      dds[i].readFields2(in);
+      System.out.println("Loading datanode : \n" + dds[i].dumpDatanode());      
+      // TODO: add to clusterMap and heartbeat if alive ???
+    }
+    
   }
 
   /**
@@ -977,6 +1065,21 @@ public class FSImage extends Storage {
     return numEdits;
   }
 
+  void putDelimiter(DataOutputStream out, int d) throws IOException{
+  	return;
+  	
+  	//for(int i=0; i<32; i++){
+  	//	out.write(d);
+  	//}
+  }
+  
+  void readDelimiter(DataInputStream in) throws IOException{
+  	return;
+  	
+  	//for(int i=0; i<32; i++){
+  	//	in.read();  		
+  	//}
+  }
   /**
    * Save the contents of the FS image to the file.
    */
@@ -993,22 +1096,133 @@ public class FSImage extends Storage {
     try {
       out.writeInt(FSConstants.LAYOUT_VERSION);
       out.writeInt(namespaceID);
+      //System.out.println("Num of Files being saved : " + fsDir.rootDir.numItemsInTree());
+      //System.out.println("root dir : " + System.identityHashCode(fsDir.rootDir));
       out.writeLong(fsDir.rootDir.numItemsInTree());
       out.writeLong(fsNamesys.getGenerationStamp());
       byte[] byteStore = new byte[4*FSConstants.MAX_PATH_LENGTH];
       ByteBuffer strbuf = ByteBuffer.wrap(byteStore);
       // save the root
       saveINode2Image(strbuf, fsDir.rootDir, out);
+      
       // save the rest of the nodes
       saveImage(strbuf, 0, fsDir.rootDir, out);
+
+      
+      putDelimiter(out, 1);
+      
+      //
+      // BFT 
+      //
+      if(bft){
+      	//System.out.println("Saving BFT information");
+      	out.writeInt(107);
+      	//Text.writeString(out, "BFT BEGIN");
+
+      	saveOrphanBlockInfos(out);
+
+      	saveDatanodeDescriptors(out);
+
+      	putDelimiter(out, 2);
+      	saveOthers(out);
+      }
       fsNamesys.saveFilesUnderConstruction(out);
       strbuf = null;
     } finally {
-      out.close();
+    	out.close();
     }
 
+    //System.out.println("FILENAME : " + newFile.getAbsolutePath());
+    
     LOG.info("Image file of size " + newFile.length() + " saved in " 
         + (FSNamesystem.now() - startTime)/1000 + " seconds.");
+  }
+  
+  //
+  // Save and Load Blocks which does not belong to any file
+  //
+  
+  private void saveOrphanBlockInfos(DataOutputStream out) throws IOException {
+  	
+  	putDelimiter(out,9);
+  	
+  	BlocksMap bMap = FSNamesystem.getFSNamesystem().blocksMap;
+  	SortedSet<BlockInfo> set = new TreeSet<BlockInfo>();
+  	for(BlockInfo bi : bMap.getBlocks()){
+  		if(bi.getINode() == null){
+  			set.add(bi);  			
+  		}  		  	
+  	}
+  	
+  	out.writeInt(set.size());
+  	System.out.println("### Saving " + set.size() + " orphan block infos out of total "
+  			+ bMap.size());
+  	
+  	for(BlockInfo bi : set){
+  		bi.write(out);
+  		out.writeInt(bi.getCapacity());
+  		System.out.println("Saving orphan block : " + bi.toString());
+  	}  	
+  }
+  
+  private void loadOrphanBlockInfos(DataInputStream in) throws IOException{
+  	
+  	readDelimiter(in);
+  	
+  	BlocksMap bMap = FSNamesystem.getFSNamesystem().blocksMap;
+  	int len = in.readInt();
+  	for(int i=0; i<len; i++){
+  		Block b = new Block();  		
+  		b.readFields(in);
+  		int replication = in.readInt();
+  		bMap.checkBlockInfo(b, replication);
+  		System.out.println("Loading orphan block : " + b);
+  	}
+  	
+  }
+
+  private void saveOthers(DataOutputStream out) throws IOException {
+    // TODO Save other fields of FSNamesystem
+    FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+    putDelimiter(out, 3);
+    fsNamesys.corruptReplicas.write(out);
+    putDelimiter(out, 4);
+    fsNamesys.saveRecentInvalidateSets(out);
+    putDelimiter(out, 5);
+    fsNamesys.saveExcessReplicateMap(out);
+    putDelimiter(out, 6);
+    fsNamesys.saveHeartbeats(out);
+    putDelimiter(out, 7);
+    fsNamesys.saveNeededAndPendingReplication(out);
+    putDelimiter(out, 8);
+    fsNamesys.saveUndecidedBlocks(out);
+    
+  }
+
+  /**
+   * 
+   * BFT
+   * Save the DatanodeDescriptors in the FSNamesystem.datanodeMap
+   * 
+   * 
+   */
+  private void saveDatanodeDescriptors(DataOutputStream out) throws IOException {
+
+    FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+    Map<String, DatanodeDescriptor> datanodeMaps = fsNamesys.datanodeMap;
+    
+    out.writeInt(datanodeMaps.size());
+    
+    for(DatanodeDescriptor dd : datanodeMaps.values()){
+      dd.write1(out);
+    }
+    
+    for(DatanodeDescriptor dd : datanodeMaps.values()){
+      dd.write2(out);
+      System.out.println("*** Saving datanode sid : " + dd.storageID);
+      System.out.println(dd.dumpDatanode());
+    }
+    
   }
 
   /**
@@ -1047,7 +1261,8 @@ public class FSImage extends Storage {
    * @return new namespaceID
    */
   private int newNamespaceID() {
-    Random r = new Random();
+    //Random r = new Random();
+    Random r = BFTRandom.getRandom();
     r.setSeed(FSNamesystem.now());
     int newID = 0;
     while(newID == 0)
@@ -1094,33 +1309,53 @@ public class FSImage extends Storage {
                                       DataOutputStream out) throws IOException {
     int nameLen = name.position();
     out.writeShort(nameLen);
+    //System.out.println("NameLen : " + nameLen);
     out.write(name.array(), name.arrayOffset(), nameLen);
+    char[] tmp = new char[nameLen];
+    for(int i=0; i< nameLen; i++){
+    	tmp[i] = (char)name.array()[i+name.arrayOffset()];
+    }
+    //System.out.println("Name : " + String.copyValueOf(tmp));
     if (!node.isDirectory()) {  // write file inode
+    	//System.out.println("file inode");
       INodeFile fileINode = (INodeFile)node;
       out.writeShort(fileINode.getReplication());
+      //System.out.println("replication : " + fileINode.getReplication());
       out.writeLong(fileINode.getModificationTime());
+      //System.out.println("modification time : " + fileINode.getModificationTime());
       out.writeLong(fileINode.getAccessTime());
+      //System.out.println("access time : " + fileINode.getAccessTime());
       out.writeLong(fileINode.getPreferredBlockSize());
+      //System.out.println("prefer block size : " + fileINode.getPreferredBlockSize());
       Block[] blocks = fileINode.getBlocks();
       out.writeInt(blocks.length);
-      for (Block blk : blocks)
+      //System.out.println("block list length : " + blocks.length);
+      for (Block blk : blocks){
+      	//System.out.println("Block : " + blk);
         blk.write(out);
+      }
       FILE_PERM.fromShort(fileINode.getFsPermissionShort());
       PermissionStatus.write(out, fileINode.getUserName(),
                              fileINode.getGroupName(),
                              FILE_PERM);
+      //System.out.println(""+fileINode.getUserName()+","+fileINode.getGroupName()
+      //		+","+FILE_PERM);
     } else {   // write directory inode
+    	//System.out.println("DIR inode");
       out.writeShort(0);  // replication
       out.writeLong(node.getModificationTime());
+      //System.out.println("Modi time : " + node.getModificationTime());
       out.writeLong(0);   // access time
       out.writeLong(0);   // preferred block size
       out.writeInt(-1);    // # of blocks
       out.writeLong(node.getNsQuota());
       out.writeLong(node.getDsQuota());
+      //System.out.println("NS quota : " + node.getNsQuota() + ", DS quota : " + node.getDsQuota());
       FILE_PERM.fromShort(node.getFsPermissionShort());
       PermissionStatus.write(out, node.getUserName(),
                              node.getGroupName(),
                              FILE_PERM);
+      //System.out.println(""+node.getUserName()+","+node.getGroupName() + ","+FILE_PERM);
     }
   }
   /**
@@ -1178,6 +1413,51 @@ public class FSImage extends Storage {
 
     for (int i = 0; i < size; i++) {
       INodeFileUnderConstruction cons = readINodeUnderConstruction(in);
+      
+      if(bft){
+      	// load datanode infos
+      	if(in.readBoolean()){ // if clientNode is not null
+      		if(in.readBoolean()){
+      			String sid = in.readUTF();
+      			cons.setClientNode(fsDir.namesystem.datanodeMap.get(sid));
+      		} else {
+      			DatanodeDescriptor dd = new DatanodeDescriptor();
+      			dd.readFields1(in);
+      			fsDir.namesystem.datanodeMap.put(dd.storageID, dd);
+      			dd.readFields2(in);
+      			fsDir.namesystem.datanodeMap.remove(dd.storageID);
+      			cons.setClientNode(dd);
+      		}
+      	}
+      	// load targets 
+      	int numTargets = in.readInt();
+      	DatanodeDescriptor[] targets = new DatanodeDescriptor[numTargets];
+      	for(int idx=0; idx < numTargets; idx++){
+        	if(in.readBoolean()){
+        		String sid = in.readUTF();
+        		targets[idx] = fsDir.namesystem.datanodeMap.get(sid);
+        	} else {
+        		DatanodeDescriptor dd = new DatanodeDescriptor();
+        		dd.readFields1(in);
+        		fsDir.namesystem.datanodeMap.put(dd.storageID, dd);
+        		dd.readFields2(in);
+        		fsDir.namesystem.datanodeMap.remove(dd.storageID);
+        		targets[idx] = dd;
+        	}
+      	}
+      	if(targets.length > 0){
+      		cons.setTargets(targets);
+      	}
+      	cons.primaryNodeIndex = in.readInt();
+      	cons.lastRecoveryTime = in.readLong();
+      	if(FSNamesystem.bftdatanode){
+      		if(in.readBoolean()){
+      			int hashsize = in.readInt();
+      			byte[] prevHash = new byte[hashsize];
+      			in.read(prevHash, 0, hashsize);
+      		}
+      	}
+      } //end of bft
 
       // verify that file exists in namespace
       String path = cons.getLocalName();
@@ -1190,7 +1470,10 @@ public class FSImage extends Storage {
       }
       INodeFile oldnode = (INodeFile) old;
       fsDir.replaceNode(path, oldnode, cons);
-      fs.leaseManager.addLease(cons.clientName, path); 
+      fs.leaseManager.addLease(cons.clientName, path);
+      if(bft){
+      	fs.leaseManager.getLease(cons.clientName).setLastUpdate(in.readLong());
+      }
     }
   }
 

@@ -58,17 +58,17 @@ public class SecondaryNameNode implements Runnable {
     LogFactory.getLog(SecondaryNameNode.class.getName());
 
   private String fsName;
-  private CheckpointStorage checkpointImage;
+  protected CheckpointStorage checkpointImage;
 
-  private NamenodeProtocol namenode;
-  private Configuration conf;
+  protected NamenodeProtocol namenode;
+  protected Configuration conf;
   private InetSocketAddress nameNodeAddr;
   private boolean shouldRun;
   private HttpServer infoServer;
   private int infoPort;
   private String infoBindAddress;
 
-  private Collection<File> checkpointDirs;
+  protected Collection<File> checkpointDirs;
   private Collection<File> checkpointEditsDirs;
   private long checkpointPeriod;	// in seconds
   private long checkpointSize;    // size (in MB) of current Edit Log
@@ -135,6 +135,9 @@ public class SecondaryNameNode implements Runnable {
         (NamenodeProtocol) RPC.waitForProxy(NamenodeProtocol.class,
             NamenodeProtocol.versionID, nameNodeAddr, conf);
 
+    FSNamesystem.bft = conf.getBoolean("dfs.bft", false);
+    CheckpointStorage.bft = FSNamesystem.bft;
+    
     // initialize checkpoint directories
     fsName = getInfoServer();
     checkpointDirs = FSImage.getCheckpointDirs(conf,
@@ -271,7 +274,7 @@ public class SecondaryNameNode implements Runnable {
   /**
    * Copy the new fsimage into the NameNode
    */
-  private void putFSImage(CheckpointSignature sig) throws IOException {
+  protected void putFSImage(CheckpointSignature sig) throws IOException {
     String fileid = "putimage=1&port=" + infoPort +
       "&machine=" +
       InetAddress.getLocalHost().getHostAddress() +
@@ -295,7 +298,8 @@ public class SecondaryNameNode implements Runnable {
   /**
    * Create a new checkpoint
    */
-  void doCheckpoint() throws IOException {
+  //void doCheckpoint() throws IOException {
+  CheckpointSignature doCheckpoint() throws IOException {
 
     // Do the required initialization of the merge work area.
     startCheckpoint();
@@ -330,6 +334,8 @@ public class SecondaryNameNode implements Runnable {
 
     LOG.warn("Checkpoint done. New Image Size: " 
               + checkpointImage.getFsImageName().length());
+    
+    return sig;
   }
 
   private void startCheckpoint() throws IOException {

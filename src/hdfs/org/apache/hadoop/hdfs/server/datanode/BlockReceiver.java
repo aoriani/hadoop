@@ -25,6 +25,8 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.LinkedList;
 import java.util.zip.CRC32;
 import java.util.zip.Checksum;
@@ -38,6 +40,7 @@ import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.FSConstants;
 import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 import org.apache.hadoop.io.IOUtils;
+import org.apache.hadoop.io.MD5Hash;
 import org.apache.hadoop.util.Daemon;
 import org.apache.hadoop.util.DataChecksum;
 import org.apache.hadoop.util.StringUtils;
@@ -51,30 +54,30 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
   public static final Log LOG = DataNode.LOG;
   static final Log ClientTraceLog = DataNode.ClientTraceLog;
   
-  private Block block; // the block to receive
+  protected Block block; // the block to receive
   protected boolean finalized;
   private DataInputStream in = null; // from where data are read
-  private DataChecksum checksum; // from where chunks of a block can be read
-  private OutputStream out = null; // to block file at local disk
-  private DataOutputStream checksumOut = null; // to crc file at local disk
-  private int bytesPerChecksum;
-  private int checksumSize;
-  private ByteBuffer buf; // contains one full packet.
-  private int bufRead; //amount of valid data in the buf
-  private int maxPacketReadLen;
+  protected DataChecksum checksum; // from where chunks of a block can be read
+  protected OutputStream out = null; // to block file at local disk
+  protected DataOutputStream checksumOut = null; // to crc file at local disk
+  protected int bytesPerChecksum;
+  protected int checksumSize;
+  protected ByteBuffer buf; // contains one full packet.
+  protected int bufRead; //amount of valid data in the buf
+  protected int maxPacketReadLen;
   protected long offsetInBlock;
   protected final String inAddr;
   protected final String myAddr;
-  private String mirrorAddr;
-  private DataOutputStream mirrorOut;
-  private Daemon responder = null;
-  private BlockTransferThrottler throttler;
-  private FSDataset.BlockWriteStreams streams;
+  protected String mirrorAddr;
+  protected DataOutputStream mirrorOut;
+  protected Daemon responder = null;
+  protected BlockTransferThrottler throttler;
+  protected FSDataset.BlockWriteStreams streams;
   private boolean isRecovery = false;
-  private String clientName;
+  protected String clientName;
   DatanodeInfo srcDataNode = null;
-  private Checksum partialCrc = null;
-  private DataNode datanode = null;
+  protected Checksum partialCrc = null;
+  protected DataNode datanode = null;
 
   BlockReceiver(Block block, DataInputStream in, String inAddr,
                 String myAddr, boolean isRecovery, String clientName, 
@@ -92,6 +95,7 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
       this.checksumSize = checksum.getChecksumSize();
       this.srcDataNode = srcDataNode;
       this.datanode = datanode;
+
       //
       // Open local disk out
       //
@@ -164,7 +168,7 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
    * While writing to mirrorOut, failure to write to mirror should not
    * affect this datanode unless a client is writing the block.
    */
-  private void handleMirrorOutError(IOException ioe) throws IOException {
+  protected void handleMirrorOutError(IOException ioe) throws IOException {
     LOG.info(datanode.dnRegistration + ":Exception writing block " +
              block + " to mirror " + mirrorAddr + "\n" +
              StringUtils.stringifyException(ioe));
@@ -183,7 +187,7 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
   /**
    * Verify multiple CRC chunks. 
    */
-  private void verifyChunks( byte[] dataBuf, int dataOff, int len, 
+  protected void verifyChunks( byte[] dataBuf, int dataOff, int len, 
                              byte[] checksumBuf, int checksumOff ) 
                              throws IOException {
     while (len > 0) {
@@ -268,7 +272,7 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
    * It tries to read a full packet with single read call.
    * Consecutive packets are usually of the same length.
    */
-  private int readNextPacket() throws IOException {
+  protected int readNextPacket() throws IOException {
     /* This dances around buf a little bit, mainly to read 
      * full packet with single read and to accept arbitarary size  
      * for next packet at the same time.
@@ -357,7 +361,7 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
    * Receives and processes a packet. It can contain many chunks.
    * returns size of the packet.
    */
-  private int receivePacket() throws IOException {
+  protected int receivePacket() throws IOException {
     
     int payloadLen = readNextPacket();
     
@@ -527,8 +531,8 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
       // indicate responder to gracefully shutdown.
       if (responder != null) {
         ((PacketResponder)responder.getRunnable()).close();
-      }
-
+      }      
+      
       // if this write is for a replication request (and not
       // from a client), then finalize block. For client-writes, 
       // the block is finalized in the PacketResponder.
@@ -565,7 +569,7 @@ class BlockReceiver implements java.io.Closeable, FSConstants {
   /**
    * Sets the file pointer in the local block file to the specified value.
    */
-  private void setBlockPosition(long offsetInBlock) throws IOException {
+  protected void setBlockPosition(long offsetInBlock) throws IOException {
     if (finalized) {
       if (!isRecovery) {
         throw new IOException("Write to offset " + offsetInBlock +

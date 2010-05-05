@@ -35,6 +35,7 @@ import org.apache.hadoop.util.DiskChecker.DiskOutOfSpaceException;
 import org.apache.hadoop.conf.*;
 import org.apache.hadoop.hdfs.server.datanode.metrics.FSDatasetMBean;
 import org.apache.hadoop.hdfs.server.protocol.InterDatanodeProtocol;
+import org.apache.hadoop.io.MD5Hash;
 
 /**************************************************
  * FSDataset manages a set of data blocks.  Each block
@@ -86,6 +87,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
         }
       }
     }
+    protected FSDir(){}
         
     public File addBlock(Block b, File src) throws IOException {
       //First try without creating subdirectories
@@ -289,13 +291,13 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   class FSVolume {
     static final double USABLE_DISK_PCT_DEFAULT = 0.98f; 
 
-    private FSDir dataDir;
-    private File tmpDir;
-    private File detachDir; // copy on write for blocks in snapshot
-    private DF usage;
-    private DU dfsUsage;
-    private long reserved;
-    private double usableDiskPct = USABLE_DISK_PCT_DEFAULT;
+    protected FSDir dataDir;
+    protected File tmpDir;
+    protected File detachDir; // copy on write for blocks in snapshot
+    protected DF usage;
+    protected DU dfsUsage;
+    protected long reserved;
+    protected double usableDiskPct = USABLE_DISK_PCT_DEFAULT;
 
     
     FSVolume(File currentDir, Configuration conf) throws IOException {
@@ -333,6 +335,8 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
       this.dfsUsage = new DU(parent, conf);
       this.dfsUsage.start();
     }
+    
+    FSVolume(){}
 
     void decDfsUsed(long value) {
       dfsUsage.decDfsUsed(value);
@@ -440,7 +444,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
      * does not exist in the original directory, then it is moved to the
      * original directory.
      */
-    private void recoverDetachedBlocks(File dataDir, File dir) 
+    protected void recoverDetachedBlocks(File dataDir, File dir) 
                                            throws IOException {
       File contents[] = dir.listFiles();
       if (contents == null) {
@@ -586,7 +590,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   }
 
   /** Find the corresponding meta data file from a given block file */
-  private static File findMetaFile(final File blockFile) throws IOException {
+  protected static File findMetaFile(final File blockFile) throws IOException {
     final String prefix = blockFile.getName() + "_";
     final File parent = blockFile.getParentFile();
     File[] matches = parent.listFiles(new FilenameFilter() {
@@ -607,7 +611,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   }
   
   /** Find the corresponding meta data file from a given block file */
-  private static long parseGenerationStamp(File blockFile, File metaFile
+  protected static long parseGenerationStamp(File blockFile, File metaFile
       ) throws IOException {
     String metaname = metaFile.getName();
     String gs = metaname.substring(blockFile.getName().length() + 1,
@@ -668,9 +672,9 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   }
 
   FSVolumeSet volumes;
-  private HashMap<Block,ActiveFile> ongoingCreates = new HashMap<Block,ActiveFile>();
-  private int maxBlocksPerDir = 0;
-  private HashMap<Block,DatanodeBlockInfo> volumeMap = null;
+  protected HashMap<Block,ActiveFile> ongoingCreates = new HashMap<Block,ActiveFile>();
+  protected int maxBlocksPerDir = 0;
+  protected HashMap<Block,DatanodeBlockInfo> volumeMap = null;
   static  Random random = new Random();
   
   /**
@@ -687,6 +691,8 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     volumes.getVolumeMap(volumeMap);
     registerMBean(storage.getStorageID());
   }
+  
+  protected FSDataset(){}
 
   /**
    * Return the total space used by dfs datanode
@@ -769,7 +775,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
                                 new FileInputStream(metaInFile.getFD()));
   }
     
-  private BlockWriteStreams createBlockWriteStreams( File f , File metafile) throws IOException {
+  protected BlockWriteStreams createBlockWriteStreams( File f , File metafile) throws IOException {
       return new BlockWriteStreams(new FileOutputStream(new RandomAccessFile( f , "rw" ).getFD()),
           new FileOutputStream( new RandomAccessFile( metafile , "rw" ).getFD() ));
 
@@ -793,7 +799,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     return info.detachBlock(block, numLinks);
   }
 
-  static private <T> void updateBlockMap(Map<Block, T> blockmap,
+  protected static <T> void updateBlockMap(Map<Block, T> blockmap,
       Block oldblock, Block newblock) throws IOException {
     if (blockmap.containsKey(oldblock)) {
       T value = blockmap.remove(oldblock);
@@ -802,7 +808,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
   }
 
   /** interrupt and wait for all ongoing create threads */
-  private synchronized void interruptOngoingCreates(Block b) {
+  protected synchronized void interruptOngoingCreates(Block b) {
     //remove ongoingCreates threads
     ActiveFile activefile = ongoingCreates.get(b);
     if (activefile != null) {
@@ -873,7 +879,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     validateBlockMetadata(newblock);
   }
 
-  static private void truncateBlock(File blockFile, File metaFile,
+  protected static void truncateBlock(File blockFile, File metaFile,
       long oldlen, long newlen) throws IOException {
     if (newlen == oldlen) {
       return;
@@ -1115,6 +1121,7 @@ public class FSDataset implements FSConstants, FSDatasetInterface {
     dest = v.addBlock(b, f);
     volumeMap.put(b, new DatanodeBlockInfo(v, dest));
     ongoingCreates.remove(b);
+    
   }
 
   /**

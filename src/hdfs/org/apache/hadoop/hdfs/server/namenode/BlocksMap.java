@@ -102,7 +102,7 @@ public class BlocksMap {
       triplets[index*3+2] = to;
     }
 
-    private int getCapacity() {
+    protected int getCapacity() {
       assert this.triplets != null : "BlockInfo is not initialized";
       assert triplets.length % 3 == 0 : "Malformed BlockInfo";
       return triplets.length / 3;
@@ -112,7 +112,8 @@ public class BlocksMap {
      * Ensure that there is enough  space to include num more triplets.
      *      * @return first free triplet index.
      */
-    private int ensureCapacity(int num) {
+    
+    private int XXensureCapacity(int num) {
       assert this.triplets != null : "BlockInfo is not initialized";
       int last = numNodes();
       if(triplets.length >= (last+num)*3)
@@ -125,6 +126,137 @@ public class BlocksMap {
         triplets[i] = old[i];
       }
       return last;
+    }
+    
+    
+    
+    /*
+     * MODIFIED BY Sangmin to introduce an invariant that
+     * datanodes in triplets are always sorted by it's SID
+     * ADD, REMOVE are modified to enforce the invariant
+     * ENSURESPACE is added.
+     * 
+     */
+    
+    
+    /**
+     * 
+     * @return index of free triplet
+     */
+    private int ensureSpace(DatanodeDescriptor newNode){
+ 
+    	assert this.triplets != null : "BlockInfo is not initialized";
+    	int index = 0;
+    	
+    	int last = numNodes();
+    	
+    	DatanodeDescriptor node = (DatanodeDescriptor)triplets[index*3];
+
+    	//System.out.println("ensureSpace 1");
+    	while(node != null && node.compareTo(newNode) < 0 && index < (triplets.length/3)-1){
+    		index++;
+    		node = (DatanodeDescriptor)triplets[index*3];    		
+    	}
+    	//System.out.println("ensureSpace 2");
+    	if(node == null){
+    		return index;
+    	} else {
+    		assert node.compareTo(newNode) != 0;
+    	}
+    	//System.out.println("ensureSpace 3");
+    	
+    	//--------
+    		int j = 1;
+    	if(triplets.length >= (last+1)*3){
+    		j += last+1*4;
+    		for(int i=last*3+2; i >= (index+1)*3; i--){
+    			triplets[i] = triplets[i-3];
+    		}
+       	//System.out.println("ensureSpace 4");
+
+    		//System.out.println("ensureSpace 5");
+    	} else {
+    			j += 24*last;
+    		//System.out.println("ensureSpace 6");
+    		// Not enough space. create a larger array
+    		Object[] old = triplets;
+    		triplets = new Object[3*(last+1)];
+    		// copy datanode that precedes the new node
+    		for(int i=0; i < index*3; i++){
+    			triplets[i] = old[i];
+    		}
+    		//System.out.println("ensureSpace 7");
+    		for(int i=index*3; i < old.length; i++){
+    			j = j-2;
+    			triplets[i+3] = old[i];
+    		}   
+    		//System.out.println("ensureSpace 8");
+    		 
+    		 
+    	}
+  		triplets[index*3] = null;
+  		triplets[index*3+1] = null;
+  		triplets[index*3+2] = null;
+    	
+    	//--------
+    	/*
+    	if((triplets.length/3) > last ){
+    		// we already have enough space
+    		for(int i=last; i>index; i--){
+    			triplets[3*i] = triplets[3*(i-1)];
+    			triplets[3*i +1] = triplets[3*(i-1) +1];
+    			triplets[3*i +2] = triplets[3*(i-1) +2];
+    		}
+    		triplets[index*3] = null;
+    		triplets[index*3+1] = null;
+    		triplets[index*3+2] = null;
+    	} else {
+    		// Not enough space. create a larger array
+    		Object[] old = triplets;
+    		triplets = new Object[3*(last+1)];
+    		// copy datanode that precedes the new node
+    		for(int i=0; i < index*3; i++){
+    			triplets[i] = old[i];
+    		}
+    		for(int i=index*3; i < old.length; i++){
+    			triplets[i+3] = old[i];
+    		}    		
+    	}    	
+    	*/
+    	//System.out.println("ensureSpace 9");
+    	return index;
+    }
+    
+    boolean addNode(DatanodeDescriptor node){
+    	assert node != null;
+      if(findDatanode(node) >= 0) // the node is already there
+        return false;
+      
+      int position = ensureSpace(node);
+      setDatanode(position, node);
+      setNext(position, null);
+      setPrevious(position, null);
+      return true;
+    }
+    
+    boolean removeNode(DatanodeDescriptor node){
+      int dnIndex = findDatanode(node);
+      if(dnIndex < 0) // the node is not found
+        return false;
+      assert getPrevious(dnIndex) == null && getNext(dnIndex) == null : 
+        "Block is still in the list and must be removed first.";
+      int lastNodeIndex = numNodes()-1;
+      int index = dnIndex;
+      while(index < lastNodeIndex){
+      	triplets[index*3] = triplets[(index+1)*3];
+      	triplets[index*3+1] = triplets[(index+1)*3+1];
+      	triplets[index*3+2] = triplets[(index+1)*3+2];
+      	index++;
+      }
+      triplets[lastNodeIndex*3] = null;
+      triplets[lastNodeIndex*3+1] = null;
+      triplets[lastNodeIndex*3+2] = null;
+      return true;
     }
 
     /**
@@ -143,7 +275,7 @@ public class BlocksMap {
     /**
      * Add data-node this block belongs to.
      */
-    boolean addNode(DatanodeDescriptor node) {
+/*    boolean addNode(DatanodeDescriptor node) {
       if(findDatanode(node) >= 0) // the node is already there
         return false;
       // find the last null node
@@ -153,10 +285,11 @@ public class BlocksMap {
       setPrevious(lastNode, null);
       return true;
     }
-
+*/
     /**
      * Remove data-node from the block.
      */
+    /*
     boolean removeNode(DatanodeDescriptor node) {
       int dnIndex = findDatanode(node);
       if(dnIndex < 0) // the node is not found
@@ -175,6 +308,7 @@ public class BlocksMap {
       setPrevious(lastNode, null); 
       return true;
     }
+    */
 
     /**
      * Find specified DatanodeDescriptor.
@@ -295,7 +429,7 @@ public class BlocksMap {
   /**
    * Add BlockInfo if mapping does not exist.
    */
-  private BlockInfo checkBlockInfo(Block b, int replication) {
+  protected BlockInfo checkBlockInfo(Block b, int replication) {
     BlockInfo info = map.get(b);
     if (info == null) {
       info = new BlockInfo(b, replication);
@@ -329,6 +463,7 @@ public class BlocksMap {
       info.inode = null;
       if (info.getDatanode(0) == null) {  // no datanodes left
         map.remove(b);  // remove block from the map
+        System.out.println("BLOCKSMAP removes block : "+b);
       }
     }
   }
@@ -347,6 +482,7 @@ public class BlocksMap {
       dn.removeBlock(blockInfo); // remove from the list and wipe the location
     }
     map.remove(blockInfo);  // remove block from the map
+    System.out.println("BLOCKSMAP removes block : "+blockInfo);
   }
 
   /** Returns the block object it it exists in the map. */
@@ -390,6 +526,7 @@ public class BlocksMap {
     if (info.getDatanode(0) == null     // no datanodes left
               && info.inode == null) {  // does not belong to a file
       map.remove(b);  // remove block from the map
+      System.out.println("BLOCKSMAP removes block : "+b);
     }
     return removed;
   }

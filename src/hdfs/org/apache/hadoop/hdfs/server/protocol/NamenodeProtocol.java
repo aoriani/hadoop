@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.hdfs.server.protocol;
 
+import java.io.File;
 import java.io.IOException;
 
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
@@ -45,6 +46,8 @@ public interface NamenodeProtocol extends VersionedProtocol {
   public BlocksWithLocations getBlocks(DatanodeInfo datanode, long size)
   throws IOException;
 
+  public String getEditLogName() throws IOException;
+  public String getNewCPName () throws IOException;
   /**
    * Get the size of the current edit log (in bytes).
    * @return The number of bytes in the current edit log.

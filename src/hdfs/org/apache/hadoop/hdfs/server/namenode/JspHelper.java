@@ -32,6 +32,7 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.jsp.JspWriter;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.BFTRandom;
 import org.apache.hadoop.hdfs.DFSClient;
 import org.apache.hadoop.hdfs.protocol.DatanodeID;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
@@ -57,7 +58,8 @@ public class JspHelper {
 
   public static final int defaultChunkSizeToView = 
     conf.getInt("dfs.default.chunk.view.size", 32 * 1024);
-  static Random rand = new Random();
+  //static Random rand = new Random();
+  static Random rand = BFTRandom.getRandom();
 
   public JspHelper() {
     if (DataNode.getDataNode() != null) {
@@ -86,6 +88,7 @@ public class JspHelper {
     if (nodes == null || nodes.length == 0) {
       throw new IOException("No nodes contain this block");
     }
+    //rand = BFTRandom.getRandom();
     while (s == null) {
       if (chosenNode == null) {
         do {

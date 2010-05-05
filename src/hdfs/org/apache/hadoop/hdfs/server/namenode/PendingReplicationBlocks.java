@@ -18,6 +18,7 @@
 package org.apache.hadoop.hdfs.server.namenode;
 
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.util.*;
 import java.io.*;
 import java.util.*;
@@ -34,11 +35,13 @@ import java.sql.Time;
  *     that never made it.
  *
  ***************************************************/
-class PendingReplicationBlocks {
+class PendingReplicationBlocks implements Writable {
   private Map<Block, PendingBlockInfo> pendingReplications;
   private ArrayList<Block> timedOutItems;
   Daemon timerThread = null;
   private volatile boolean fsRunning = true;
+  PendingReplicationMonitor pendingReplicationMonitor;
+
 
   //
   // It might take anywhere between 5 to 10 minutes before
@@ -61,8 +64,13 @@ class PendingReplicationBlocks {
   void init() {
     pendingReplications = new HashMap<Block, PendingBlockInfo>();
     timedOutItems = new ArrayList<Block>();
-    this.timerThread = new Daemon(new PendingReplicationMonitor());
-    timerThread.start();
+    
+    if(FSNamesystem.bft){
+    	pendingReplicationMonitor = new PendingReplicationMonitor();
+    }else{
+    	this.timerThread = new Daemon(new PendingReplicationMonitor());
+    	timerThread.start();
+    }
   }
 
   /**
@@ -222,6 +230,8 @@ class PendingReplicationBlocks {
    */
   void stop() {
     fsRunning = false;
+    if(timerThread == null)
+    	return;
     timerThread.interrupt();
     try {
       timerThread.join(3000);
@@ -247,5 +257,70 @@ class PendingReplicationBlocks {
                     pendingBlock.numReplicasInProgress);
       }
     }
+  }
+
+
+  public void readFields(DataInput in) throws IOException {
+    FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+    BlocksMap blocksMap = fsNamesys.blocksMap;
+    
+    pendingReplications.clear();
+    int size = in.readInt();
+    for (int i=0; i < size; i++){
+    	Block _block = new Block(in.readLong());
+    	//System.out.println("### READ 1 : " + _block);
+      Block b = blocksMap.getStoredBlock(_block);
+      if(b == null){
+      	System.out.println("Block " + b +" was not found in blocksMap");
+      	b = _block;
+      }
+      long timeStamp = in.readLong();
+      int numReplicasInProgress = in.readInt();
+      
+      PendingBlockInfo pbi = new PendingBlockInfo(numReplicasInProgress);
+      pbi.timeStamp = timeStamp;
+      
+      pendingReplications.put(b, pbi);
+    }
+    
+    timedOutItems.clear();
+    size = in.readInt();
+    for (int i=0; i<size; i++){
+      timedOutItems.add(blocksMap.getStoredBlock(new Block(in.readLong())));
+    }
+    
+  }
+
+  public void write(DataOutput out) throws IOException {
+  	BlocksMap blocksMap = FSNamesystem.getFSNamesystem().blocksMap;
+    //System.out.println("### WRITE 1");
+    int size = pendingReplications.size();
+    out.writeInt(size);
+    //System.out.println("### WRITE 2 : " + size);
+    for (Block b: pendingReplications.keySet()){
+    	if(blocksMap.getStoredBlock(b) == null){
+    		System.out.println("Block " + b + " is in pendingReplicatin but not in blocksmap!");
+    	}
+      out.writeLong(b.getBlockId());
+      //System.out.println("bid"+b.getBlockId());
+      PendingBlockInfo pbi = pendingReplications.get(b);
+      out.writeLong(pbi.timeStamp);
+      //System.out.println("pbistamp:"+pbi.timeStamp);
+      out.writeInt(pbi.numReplicasInProgress);
+      //System.out.println("nrip"+pbi.numReplicasInProgress);
+    }
+    //System.out.println("### WRITE 3");
+
+    size = timedOutItems.size();
+    out.writeInt(size);
+    Iterator<Block> iter = timedOutItems.iterator();
+    //System.out.println("### WRITE 4 : " + size);
+    while (iter.hasNext()){
+      Block b = iter.next();
+      out.writeLong(b.getBlockId());
+      //System.out.println("bid"+b.getBlockId());
+    }
+    //System.out.println("### WRITE 5");
+    
   }
 }

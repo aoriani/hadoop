@@ -17,6 +17,9 @@
  */
 package org.apache.hadoop.net;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -26,6 +29,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.hdfs.BFTRandom;
+import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
+import org.apache.hadoop.hdfs.server.namenode.DatanodeDescriptor;
+import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
 
 /** The class represents a cluster of computer with a tree hierarchical
  * network topology.
@@ -36,7 +45,7 @@ import org.apache.commons.logging.LogFactory;
  * or racks.  
  * 
  */
-public class NetworkTopology {
+public class NetworkTopology implements Writable {
   public final static String DEFAULT_RACK = "/default-rack";
   public final static int DEFAULT_HOST_LEVEL = 2;
   public static final Log LOG = 
@@ -45,7 +54,7 @@ public class NetworkTopology {
   /* Inner Node represent a switch/router of a data center or rack.
    * Different from a leave node, it has non-null children.
    */
-  private class InnerNode extends NodeBase {
+  private class InnerNode extends NodeBase{
     private ArrayList<Node> children=new ArrayList<Node>();
     private int numOfLeaves;
         
@@ -65,6 +74,10 @@ public class NetworkTopology {
       super(name, location, parent, level);
     }
         
+    public InnerNode() {
+      // TODO Auto-generated constructor stub
+    }
+
     /** Get its children */
     Collection<Node> getChildren() {return children;}
         
@@ -293,6 +306,66 @@ public class NetworkTopology {
     int getNumOfLeaves() {
       return numOfLeaves;
     }
+
+    public void readFields(DataInput in, int levelToBe) throws IOException {
+      FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+
+      this.numOfLeaves = in.readInt();
+      int numChildren = in.readInt();
+      boolean isRack = in.readBoolean();
+      if(in.readBoolean()){
+	name = Text.readString(in);
+      }else{
+	name = "";
+      }
+      location = Text.readString(in);
+      
+      if (isRack) {
+        for(int i=0; i<numChildren; i++){
+          DatanodeInfo dataInfo = fsNamesys.getDataNodeInfo(Text.readString(in));
+          children.add(dataInfo);
+          dataInfo.setLevel(levelToBe+1);
+          dataInfo.setParent(this);
+        }
+      } else {
+        for(int i=0; i<numChildren; i++){
+          InnerNode innerNode = new InnerNode();
+          innerNode.setParent(this);
+          innerNode.readFields(in, levelToBe+1);
+          children.add(innerNode);
+        }
+      }
+      
+      this.level = levelToBe;
+      
+    }
+
+    public void write(DataOutput out) throws IOException {
+    	out.writeInt(numOfLeaves);
+    	int numChildren = children.size();
+    	out.writeInt(numChildren);
+    	out.writeBoolean(isRack());
+    	if(name!=null && name.length() > 0){
+    		out.writeBoolean(true);
+    		Text.writeString(out,name);
+    	}else{
+    		out.writeBoolean(false);
+    	}
+    	Text.writeString(out, location);
+    	if (isRack()) {
+    		for(int i=0; i < numChildren; i++){
+    			DatanodeDescriptor datanode = (DatanodeDescriptor) children.get(i);
+    			Text.writeString(out, datanode.storageID);
+    		}        
+    	} else {
+    		for(int i=0; i< numChildren; i++){
+    			InnerNode innerNode = (InnerNode) children.get(i);
+    			innerNode.write(out);
+    		}
+
+    	}
+
+    }
   } // end of InnerNode
     
   InnerNode clusterMap = new InnerNode(InnerNode.ROOT); // the root
@@ -329,8 +402,7 @@ public class NetworkTopology {
         if (rack == null) {
           numOfRacks++;
         }
-      }
-      LOG.debug("NetworkTopology became:\n" + this.toString());
+      }      
     } finally {
       netlock.writeLock().unlock();
     }
@@ -356,7 +428,6 @@ public class NetworkTopology {
           numOfRacks--;
         }
       }
-      LOG.debug("NetworkTopology became:\n" + this.toString());
     } finally {
       netlock.writeLock().unlock();
     }
@@ -489,7 +560,8 @@ public class NetworkTopology {
     }
   }
     
-  final private static Random r = new Random();
+  //final private static Random r = new Random();
+  private static Random r = BFTRandom.getRandom();
   /** randomly choose one node from <i>scope</i>
    * if scope starts with ~, choose one from the all nodes except for the
    * ones in <i>scope</i>; otherwise, choose one from <i>scope</i>
@@ -652,5 +724,16 @@ public class NetworkTopology {
     if(tempIndex == 0 && nodes.length != 0) {
       swap(nodes, 0, r.nextInt(nodes.length));
     }
+  }
+
+  public void readFields(DataInput in) throws IOException {
+    numOfRacks = in.readInt();
+    clusterMap.readFields(in, clusterMap.level);
+  }
+
+  public void write(DataOutput out) throws IOException {
+    out.writeInt(numOfRacks);
+    clusterMap.write(out);
+    
   }
 }

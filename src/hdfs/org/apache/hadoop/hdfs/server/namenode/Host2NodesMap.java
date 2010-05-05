@@ -17,14 +17,23 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.*;
+import java.util.Map.Entry;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-class Host2NodesMap {
+import org.apache.hadoop.hdfs.BFTRandom;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
+
+class Host2NodesMap implements Writable {
   private HashMap<String, DatanodeDescriptor[]> map
     = new HashMap<String, DatanodeDescriptor[]>();
-  private Random r = new Random();
+  //private Random r = new Random();
+  private Random r = BFTRandom.getRandom();
   private ReadWriteLock hostmapLock = new ReentrantReadWriteLock();
                       
   /** Check if node is already in the map. */
@@ -144,6 +153,7 @@ class Host2NodesMap {
         return nodes[0];
       }
       // more than one node
+      //r = BFTRandom.getRandom();
       return nodes[r.nextInt(nodes.length)];
     } finally {
       hostmapLock.readLock().unlock();
@@ -184,5 +194,43 @@ class Host2NodesMap {
     } finally {
       hostmapLock.readLock().unlock();
     }
+  }
+
+  public void readFields(DataInput in) throws IOException {
+    FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+
+    map.clear();
+    
+    int size = in.readInt();
+    
+    for(int i=0; i<size; i++){
+      String s = Text.readString(in);
+      int nNodes = in.readInt();
+      DatanodeDescriptor[] nodes = new DatanodeDescriptor[nNodes];
+      for(int j=0; j<nNodes; j++){
+        nodes[j] = fsNamesys.datanodeMap.get(Text.readString(in));
+        assert nodes[j] != null;             
+      }
+      map.put(s, nodes);
+      
+    }
+    
+  }
+
+  public void write(DataOutput out) throws IOException {
+    out.writeInt(map.size());
+    //System.out.println("host2nodemap size:"+map.size());
+    
+    for(String s : map.keySet()){
+      Text.writeString(out, s);
+      //System.out.println("key:"+s);
+      DatanodeDescriptor[] nodes = map.get(s);
+      out.writeInt(nodes.length);
+      for(int i=0; i < nodes.length; i++){
+        Text.writeString(out, nodes[i].getStorageID());
+        //System.out.println("nodes:"+nodes[i].getStorageID());
+      }
+    }
+    
   }
 }

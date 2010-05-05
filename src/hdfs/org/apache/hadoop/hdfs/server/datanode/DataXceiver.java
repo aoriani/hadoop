@@ -168,8 +168,13 @@ class DataXceiver implements Runnable, FSConstants {
             s.getInetAddress();
     try {
       try {
-        blockSender = new BlockSender(block, startOffset, length,
-            true, true, false, datanode, clientTraceFmt);
+      	if(datanode.bftdatanode){
+      		blockSender = new BFTBlockSender(block, startOffset, length,
+      				true, true, false, datanode, clientTraceFmt);
+      	}else{
+      		blockSender = new BlockSender(block, startOffset, length,
+      				true, true, false, datanode, clientTraceFmt);
+      	}
       } catch(IOException e) {
         out.writeShort(DataTransferProtocol.OP_STATUS_ERROR);
         throw e;
@@ -254,12 +259,18 @@ class DataXceiver implements Runnable, FSConstants {
     String mirrorNode = null;           // the name:port of next target
     String firstBadLink = "";           // first datanode that failed in connection setup
     try {
-      // open a block receiver and check if the block does not exist
-      blockReceiver = new BlockReceiver(block, in, 
-          s.getRemoteSocketAddress().toString(),
-          s.getLocalSocketAddress().toString(),
-          isRecovery, client, srcDataNode, datanode);
-
+    	// open a block receiver and check if the block does not exist
+    	if(datanode.bftdatanode){
+    		blockReceiver = new BFTBlockReceiver(block, in, 
+    				s.getRemoteSocketAddress().toString(),
+    				s.getLocalSocketAddress().toString(),
+    				isRecovery, client, srcDataNode, datanode);
+    	} else {
+    		blockReceiver = new BlockReceiver(block, in, 
+    				s.getRemoteSocketAddress().toString(),
+    				s.getLocalSocketAddress().toString(),
+    				isRecovery, client, srcDataNode, datanode);
+    	}
       // get a connection back to the previous target
       replyOut = new DataOutputStream(
                      NetUtils.getOutputStream(s, datanode.socketWriteTimeout));
@@ -576,11 +587,17 @@ class DataXceiver implements Runnable, FSConstants {
       proxyReply = new DataInputStream(new BufferedInputStream(
           NetUtils.getInputStream(proxySock), BUFFER_SIZE));
       // open a block receiver and check if the block does not exist
-      blockReceiver = new BlockReceiver(
-          block, proxyReply, proxySock.getRemoteSocketAddress().toString(),
-          proxySock.getLocalSocketAddress().toString(),
-          false, "", null, datanode);
-
+      if(datanode.bftdatanode){
+      	blockReceiver = new BFTBlockReceiver(
+      			block, proxyReply, proxySock.getRemoteSocketAddress().toString(),
+      			proxySock.getLocalSocketAddress().toString(),
+      			false, "", null, datanode);
+      } else {
+      	blockReceiver = new BlockReceiver(
+      			block, proxyReply, proxySock.getRemoteSocketAddress().toString(),
+      			proxySock.getLocalSocketAddress().toString(),
+      			false, "", null, datanode);
+      }
       // receive a block
       blockReceiver.receiveBlock(null, null, null, null, 
           dataXceiverServer.balanceThrottler, -1);

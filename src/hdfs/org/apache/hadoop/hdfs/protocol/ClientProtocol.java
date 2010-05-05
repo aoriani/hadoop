@@ -174,6 +174,8 @@ public interface ClientProtocol extends VersionedProtocol {
    * @return LocatedBlock allocated block information.
    */
   public LocatedBlock addBlock(String src, String clientName) throws IOException;
+  
+  public LocatedBlock addBlock(String src, String clentName, byte[] hashOfPreviousBlock) throws IOException;
 
   /**
    * The client is done writing data to the given filename, and would 
@@ -188,6 +190,8 @@ public interface ClientProtocol extends VersionedProtocol {
    * times before succeeding.
    */
   public boolean complete(String src, String clientName) throws IOException;
+  
+  public boolean complete(String src, String clientName, byte[] hasOfLastBlock) throws IOException;
 
   /**
    * The client wants to report corrupted blocks (blocks with specified
@@ -448,4 +452,23 @@ public interface ClientProtocol extends VersionedProtocol {
    *              by this call.
    */
   public void setTimes(String src, long mtime, long atime) throws IOException;
+  
+  //
+  // Followings are added for BFT Datanode
+  // Used for client initiated sync rather then primary datanode
+  //
+  
+  /**
+   * @return the next GenerationStamp to be associated with the specified
+   * block. 
+   */
+  public long nextGenerationStamp(Block block) throws IOException;
+
+  /**
+   * Commit block synchronization in lease recovery
+   */
+  public void commitBlockSynchronization(Block block,
+      long newgenerationstamp, long newlength,
+      boolean closeFile, boolean deleteblock, DatanodeID[] newtargets
+      ) throws IOException;
 }

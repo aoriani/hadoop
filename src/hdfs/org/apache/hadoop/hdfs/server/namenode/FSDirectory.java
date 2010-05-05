@@ -78,7 +78,7 @@ class FSDirectory implements FSConstants, Closeable {
                    Collection<File> editsDirs,
                    StartupOption startOpt) throws IOException {
     // format before starting up if requested
-    if (startOpt == StartupOption.FORMAT) {
+    if (startOpt == StartupOption.FORMAT) {    	    	
       fsImage.setStorageDirectories(dataDirs, editsDirs);
       fsImage.format();
       startOpt = StartupOption.REGULAR;
@@ -118,6 +118,11 @@ class FSDirectory implements FSConstants, Closeable {
    * Block until the object is ready to be used.
    */
   void waitForReady() {
+    
+    if(FSNamesystem.getFSNamesystem().bftReplaying){
+      return;
+    }
+    
     if (!ready) {
       synchronized (this) {
         while (!ready) {
@@ -142,8 +147,9 @@ class FSDirectory implements FSConstants, Closeable {
                 DatanodeDescriptor clientNode,
                 long generationStamp) 
                 throws IOException {
+    
     waitForReady();
-
+    
     // Always do an implicit mkdirs for parent directory tree.
     long modTime = FSNamesystem.now();
     if (!mkdirs(new Path(path).getParent().toString(), permissions, true,
@@ -154,9 +160,11 @@ class FSDirectory implements FSConstants, Closeable {
                                  permissions,replication,
                                  preferredBlockSize, modTime, clientName, 
                                  clientMachine, clientNode);
+    
     synchronized (rootDir) {
       newNode = addNode(path, newNode, -1, false);
     }
+    
     if (newNode == null) {
       NameNode.stateChangeLog.info("DIR* FSDirectory.addFile: "
                                    +"failed to add "+path
@@ -206,6 +214,21 @@ class FSDirectory implements FSConstants, Closeable {
       return newNode;
     }
   }
+  
+  INodeDirectory addToParent( String src,
+      INodeDirectory parentINode,
+      PermissionStatus permissions,
+      Block[] blocks, 
+      short replication,
+      long modificationTime,
+      long atime,
+      long nsQuota,
+      long dsQuota,
+      long preferredBlockSize) {
+  	return addToParent(src, parentINode, permissions, blocks, replication,
+  											modificationTime, atime, nsQuota, dsQuota,
+  											preferredBlockSize, true);
+  }
 
   INodeDirectory addToParent( String src,
                               INodeDirectory parentINode,
@@ -216,7 +239,8 @@ class FSDirectory implements FSConstants, Closeable {
                               long atime,
                               long nsQuota,
                               long dsQuota,
-                              long preferredBlockSize) {
+                              long preferredBlockSize,
+                              boolean updateParentModificationTime) {
     // NOTE: This does not update space counts for parents
     // create new inode
     INode newNode;
@@ -234,7 +258,7 @@ class FSDirectory implements FSConstants, Closeable {
     INodeDirectory newParent = null;
     synchronized (rootDir) {
       try {
-        newParent = rootDir.addToParent(src, newNode, parentINode, false);
+        newParent = rootDir.addToParent(src, newNode, parentINode, false, updateParentModificationTime);
       } catch (FileNotFoundException e) {
         return null;
       }
@@ -844,6 +868,8 @@ class FSDirectory implements FSConstants, Closeable {
                            long nsDelta, long dsDelta)
                            throws QuotaExceededException {
     if (!ready) {
+    	System.out.println("### !! FSDirectory is not ready yet !! ###");
+    	//(new Throwable()).printStackTrace();
       //still intializing. do not check or update quotas.
       return;
     }
@@ -932,7 +958,7 @@ class FSDirectory implements FSConstants, Closeable {
         }
         // Directory creation also count towards FilesCreated
         // to match count of files_deleted metric. 
-        if (namesystem != null)
+        if (namesystem != null && !namesystem.bftReplaying)
           NameNode.getNameNodeMetrics().numFilesCreated.inc();
         fsImage.getEditLog().logMkDir(cur, inodes[i]);
         NameNode.stateChangeLog.debug(

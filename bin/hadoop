@@ -56,8 +56,10 @@ if [ $# = 0 ]; then
   echo "Usage: hadoop [--config confdir] COMMAND"
   echo "where COMMAND is one of:"
   echo "  namenode -format     format the DFS filesystem"
+  echo "  namenode -helper     run the DFS namenode checkpoint helper (Only for HDFS-UpRight)"
   echo "  secondarynamenode    run the DFS secondary namenode"
   echo "  namenode             run the DFS namenode"
+  echo "  uprightclientproxy   run the UpRight Client Proxy"
   echo "  datanode             run a DFS datanode"
   echo "  dfsadmin             run a DFS admin client"
   echo "  fsck                 run a DFS filesystem checking utility"
@@ -173,6 +175,9 @@ unset IFS
 if [ "$COMMAND" = "namenode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.namenode.NameNode'
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_NAMENODE_OPTS"
+elif [ "$COMMAND" = "uprightclientproxy" ] ; then
+  CLASS='org.apache.hadoop.hdfs.BftClientGlue'
+  HADOOP_OPTS="$HADOOP_OPTS"
 elif [ "$COMMAND" = "secondarynamenode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.namenode.SecondaryNameNode'
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_SECONDARYNAMENODE_OPTS"

@@ -18,8 +18,13 @@
 package org.apache.hadoop.hdfs.server.namenode;
 
 import org.apache.hadoop.hdfs.protocol.Block;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.ipc.Server;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.util.*;
 
 /**
@@ -31,7 +36,7 @@ import java.util.*;
  * Mapping: Block -> TreeSet<DatanodeDescriptor> 
  */
 
-public class CorruptReplicasMap{
+public class CorruptReplicasMap implements Writable{
 
   private Map<Block, Collection<DatanodeDescriptor>> corruptReplicasMap =
     new TreeMap<Block, Collection<DatanodeDescriptor>>();
@@ -129,5 +134,48 @@ public class CorruptReplicasMap{
   public int numCorruptReplicas(Block blk) {
     Collection<DatanodeDescriptor> nodes = getNodes(blk);
     return (nodes == null) ? 0 : nodes.size();
+  }
+
+  // BFT
+  
+  public void readFields(DataInput in) throws IOException {
+    FSNamesystem fsNamesys = FSNamesystem.getFSNamesystem();
+    BlocksMap blocksMap = fsNamesys.blocksMap;
+    
+    //System.out.println("======-------- " + Text.readString(in));
+    int nBlocks = in.readInt();
+    for(int i=0; i < nBlocks; i++){
+      Block b = new Block(in.readLong());      
+      b = blocksMap.getStoredBlock(b);
+      assert b != null;
+      int nNodes = in.readInt();
+      for(int j=0; j<nNodes; j++){
+        DatanodeDescriptor dd = (DatanodeDescriptor) fsNamesys.getDataNodeInfo(Text.readString(in));
+        assert dd != null;
+        this.addToCorruptReplicasMap(b, dd);        
+      }      
+      
+    }
+    //System.out.println("======-------- " + Text.readString(in));
+    
+  }
+
+  public void write(DataOutput out) throws IOException {
+    //Text.writeString(out, "START CRROUPTREPLICASMAP");
+    int nBlocks = corruptReplicasMap.size();
+    out.writeInt(nBlocks);
+    //System.out.println("crmap size:"+nBlocks);
+    
+    for(Block b : corruptReplicasMap.keySet()){
+      out.writeLong(b.getBlockId());
+      //System.out.println("bid:"+b.getBlockId());
+      Collection<DatanodeDescriptor> nodes = getNodes(b);
+      out.writeInt(nodes.size());
+      for(DatanodeDescriptor dd : nodes){
+      	//System.out.println("sid:"+dd.storageID);
+        Text.writeString(out, dd.storageID);
+      }
+    }
+    //Text.writeString(out, "END CRROUPTREPLICASMAP");
   }
 }

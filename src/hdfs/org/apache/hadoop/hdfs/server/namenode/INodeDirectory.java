@@ -201,7 +201,7 @@ public class INodeDirectory extends INode {
     
     return inodes;
   }
-
+  
   /**
    * Add a child inode to the directory.
    * 
@@ -211,6 +211,11 @@ public class INodeDirectory extends INode {
    *          node, otherwise
    */
   <T extends INode> T addChild(final T node, boolean inheritPermission) {
+  	return addChild(node, inheritPermission, true);
+  }
+  
+  <T extends INode> T addChild(final T node, boolean inheritPermission,
+  		boolean updateModificationTime) {
     if (inheritPermission) {
       FsPermission p = getFsPermission();
       //make sure the  permission has wx for the user
@@ -230,7 +235,11 @@ public class INodeDirectory extends INode {
     node.parent = this;
     children.add(-low - 1, node);
     // update modification time of the parent directory
-    setModificationTime(node.getModificationTime());
+    // However, we don't want to update modification time
+    // if this is part of loading image from disk
+    if (updateModificationTime){
+    	setModificationTime(node.getModificationTime());
+    }
     if (node.getGroupName() == null) {
       node.setGroup(getGroupName());
     }
@@ -272,10 +281,19 @@ public class INodeDirectory extends INode {
    *          is not a directory.
    */
   <T extends INode> INodeDirectory addToParent(
+      String path,
+      T newNode,
+      INodeDirectory parent,
+      boolean inheritPermission
+    ) throws FileNotFoundException {
+  	return addToParent(path, newNode, parent, inheritPermission, true);
+  }
+  <T extends INode> INodeDirectory addToParent(
                                       String path,
                                       T newNode,
                                       INodeDirectory parent,
-                                      boolean inheritPermission
+                                      boolean inheritPermission,
+                                      boolean updateParentModificationTime
                                     ) throws FileNotFoundException {
     byte[][] pathComponents = getPathComponents(path);
     assert pathComponents != null : "Incorrect path " + path;
@@ -297,7 +315,7 @@ public class INodeDirectory extends INode {
     }
     // insert into the parent children list
     newNode.name = pathComponents[pathLen-1];
-    if(parent.addChild(newNode, inheritPermission) == null)
+    if(parent.addChild(newNode, inheritPermission, updateParentModificationTime) == null)
       return null;
     return parent;
   }

@@ -21,6 +21,7 @@ import java.io.IOException;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.hdfs.server.protocol.BlockMetaDataInfo;
 import org.apache.hadoop.ipc.VersionedProtocol;
 
 /** An client-datanode protocol for block recovery
@@ -42,4 +43,18 @@ public interface ClientDatanodeProtocol extends VersionedProtocol {
    * @throws IOException
    */
   LocatedBlock recoverBlock(Block block, DatanodeInfo[] targets) throws IOException;
+  
+  
+  //
+  // The following is added for client initiated recovery
+  // (taken from InterDatanodeProtocol)
+  
+  /** @return the BlockMetaDataInfo of a block;
+   *  null if the block is not found 
+   */
+  BlockMetaDataInfo getBlockMetaDataInfo(Block block) throws IOException;
+  /**
+   * Update the block to the new generation stamp and length.  
+   */
+  void updateBlock(Block oldblock, Block newblock, boolean finalize) throws IOException;
 }

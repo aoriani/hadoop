@@ -66,6 +66,21 @@ public class FileStatus implements Writable, Comparable {
     this.group = (group == null) ? "" : group;
     this.path = path;
   }
+  
+  public String toString(){
+  	String ret = path.toString() + "\n" +
+  								"length:"+ length +
+  								"\nisdir:" + isdir +
+  								"\nblock_replication:" + block_replication+
+  								"\nblocksize:"+blocksize+
+  								"\nmodification_time:"+modification_time+
+  								"\naccess_time"+access_time+
+  								"\npermission:"+permission.toString()+
+  								"\nowner:"+owner+
+  								"\ngroup:"+group;  								  								
+  	
+  	return ret;
+  }
 
   /* 
    * @return the length of this file, in blocks
